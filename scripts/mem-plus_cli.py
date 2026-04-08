@@ -226,10 +226,76 @@ def exact_boost_score(content: str, query: str) -> float:
     return 0.5 * (matched / len(terms))
 
 
+def _looks_like_filename(query: str) -> bool:
+    """判断查询是否像文件名。"""
+    if len(query) > 50 or len(query) < 3:
+        return False
+    if ' ' in query.strip():
+        return False
+    if not any(c.isupper() for c in query):
+        return False
+    return True
+
+
+def _filename_direct_inject(query: str, results: list) -> list:
+    """
+    根因修复：MemPalace 向量搜索对文件名 heading 查询从根本上失效。
+    直接读文件系统，精确查找包含 "# {query}" 的文件。
+    找到后：若已存在结果中→提升为 rank1（置顶+超高boost）；
+           若不存在→注入到 rank1。
+    """
+    if not _looks_like_filename(query):
+        return results
+
+    workspace = os.path.expanduser('~/.openclaw/workspace')
+
+    # 直接扫描 workspace 找 heading 匹配的文件
+    matched_result = None
+    try:
+        for fname in os.listdir(workspace):
+            fpath = os.path.join(workspace, fname)
+            if not os.path.isfile(fpath):
+                continue
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in ('.md', '.txt', '.json', '.py', '.yaml', '.yml'):
+                continue
+            try:
+                with open(fpath, encoding='utf-8', errors='ignore') as f:
+                    first_lines = ''.join(f.readlines()[:50])
+                # heading 精确匹配：行首 # 后跟 query（忽略大小写）
+                heading_pattern = rf'^#\s*{re.escape(query)}\b'
+                if re.search(heading_pattern, first_lines, re.MULTILINE | re.IGNORECASE):
+                    with open(fpath, encoding='utf-8', errors='ignore') as f:
+                        full_content = f.read(50000)
+                    matched_result = {
+                        'content': full_content,
+                        'score': 999.0,
+                        'source': fname,
+                        'meta': {'mtime': os.path.getmtime(fpath)},
+                        '_injected': True,
+                        '_filename_boost': 999.0,
+                    }
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    if not matched_result:
+        return results
+
+    # 从结果中移除同名文件（如果有）
+    results = [r for r in results if r.get('source', '') != matched_result['source']]
+    # 插入到 rank1
+    results.insert(0, matched_result)
+    return results
+
+
 def filename_detection(query: str, content: str) -> float:
     """
     SuperMem: if query looks like a filename (short, no spaces, has capitals),
     and content contains it as a markdown heading, boost.
+    Note: _filename_direct_inject handles injection; this is secondary boost.
     """
     if len(query) > 50 or ' ' in query.strip():
         return 0.0
@@ -413,17 +479,35 @@ def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True, tw=0.1, hl
     steps.append('credential_filter')
 
     before_dedup = len(results)
+
+    # ═══════════════════════════════════════════════════════
+    # ROOT CAUSE FIX: filename direct inject
+    # 当查询像文件名时（query="SOUL.md"），MemPalace 向量搜索
+    # 根本不返回 SOUL.md，因为向量空间不匹配。
+    # 这里用 heading 搜索直接召回并注入 results 最前。
+    # ═══════════════════════════════════════════════════════
+    results = _filename_direct_inject(query, results)
+
     if dedup:
+        # 注意：dedup_results 对注入结果也做同源去重
+        # _filename_direct_inject 注入时已检查过同源，这里保留作为双重保障
         results = dedup_results(results)
         steps.append(f'dedup({before_dedup}→{len(results)})')
 
     # All boosts
     TW = tw  # temporal weight: tunable, default 10%, won't override identity boost
     for r in results:
-        r['_identity_boost'] = identity_boost_score(r['source'], r['content'], query)
-        r['_kw_boost'] = keyword_boost_score(r['content'], query)
-        r['_exact_boost'] = exact_boost_score(r['content'], query)
-        r['_filename_boost'] = filename_detection(query, r['content'])
+        # 注入结果（_injected=True）已预置 filename_boost=999.0，跳过重算
+        if r.get('_injected'):
+            r['_identity_boost'] = identity_boost_score(r['source'], r['content'], query)
+            r['_kw_boost'] = 0.0
+            r['_exact_boost'] = 2.0  # heading 精确匹配
+            r['_filename_boost'] = r.get('_filename_boost', 999.0)
+        else:
+            r['_identity_boost'] = identity_boost_score(r['source'], r['content'], query)
+            r['_kw_boost'] = keyword_boost_score(r['content'], query)
+            r['_exact_boost'] = exact_boost_score(r['content'], query)
+            r['_filename_boost'] = filename_detection(query, r['content'])
         mtime = get_mtime_from_meta(r.get('meta', {}))
         r['_temporal_decay'] = temporal_decay(mtime, half_life=hl)
         decay = r['_temporal_decay']
