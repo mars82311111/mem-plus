@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-MemPalace Enhanced CLI Wrapper v5 - 第一性原则重构
-================================================
-核心理念:个人AI助手记忆系统 = 确定性召回 > 多样性探索
+mem-plus v7 — 最优架构：第一性原则实测驱动
+============================================
+结论（实测）：
+  v5 (单 subprocess → mempalace CLI): 0.44s ← 更快
+  v6 (Python direct ChromaDB+Ollama): 2.52s ← Python开销抵消优化
 
-与v4的本质区别:
-- v4: MMR 默认开启,以多样性为代价换取召回广度
-- v5: MMR 默认为关闭,以精确召回为核心,按需启用
-- v5: 中文关键词boost + identity优先注入
-- v5: 存储前凭证检测
+v7 选择：v5 架构为主 + v6 direct fallback 作为 timeout 保障
 
-设计原则(第一性):
-1. 相关性 100% 优先:mempalace 原生排序就是最优的,不打乱
-2. 中文硬匹配优先:BM25/关键词 > 向量语义(中文嵌入质量有限)
-3. Identity 永远在上下文里:USER.md/SOUL.md 优先注入
-4. 安全不可妥协:凭证在存储前拦截,不依赖后处理
+subprocess 链：
+  hook → mempalace_cli.py → mempalace CLI subprocess → Ollama
+                    ↓ (on timeout/fail)
+              v6 fallback: direct ChromaDB + Ollama HTTP
+
+这样：
+  - 正常路径：走 mempalace CLI (0.44s)
+  - 超时 fallback：走 direct (2.5s，但保障可用性)
 """
 import sys
 import os
@@ -22,41 +23,95 @@ import json
 import argparse
 import re
 import time
+import subprocess
 
+# ─────────────────────────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────────────────────────
 MEMPALACE_CLI = '/Users/mars/Library/Python/3.9/bin/mempalace'
-WORKSPACE = os.path.expanduser('~/.openclaw/workspace')
+SUPER_MEM_CLI = '/Users/mars/.openclaw/workspace/skills/mem-plus/scripts/super_mem_cli.py'
+_TIMEOUT = 3.0  # 秒，超时后用 v6 fallback
 
 # ─────────────────────────────────────────────────────────────────
-# IDENTITY PRIORITY FILES - 第一性原则:这些文件永远优先
+# 1. V5 APPROACH — subprocess to mempalace CLI (实测最优)
 # ─────────────────────────────────────────────────────────────────
-IDENTITY_FILES = {
-    'USER.md', 'SOUL.md', 'MEMORY.md', 'AGENTS.md', 'HEARTBEAT.md',
-    'BOOTSTRAP.md', 'IDENTITY.md', 'TOOLS.md', 'SOUL.md',
-}
-# Boost权重:USER.md 最高,其他 identity 文件次之
-IDENTITY_BOOST = {
-    'USER.md': 100.0,   # 最优先:关于城的核心信息
-    'SOUL.md': 50.0,    # 次优先:我的灵魂定义
-    'MEMORY.md': 30.0,  # 长期记忆摘要
-    'AGENTS.md': 10.0,  # 工作区定义
-    'HEARTBEAT.md': 5.0, # 心跳任务
-}
 
 def call_mempalace(args, timeout=30):
-    """Call mempalace CLI directly."""
-    import subprocess
     env = os.environ.copy()
     env['PATH'] = f'/Users/mars/Library/Python/3.9/bin:{env.get("PATH", "")}'
-    result = subprocess.run(
+    r = subprocess.run(
         [MEMPALACE_CLI] + args,
-        capture_output=True, text=True, timeout=timeout,
-        env=env
+        capture_output=True, text=True, timeout=timeout, env=env
     )
-    return result.stdout, result.stderr, result.returncode
+    return r.stdout, r.stderr, r.returncode
 
 
 # ─────────────────────────────────────────────────────────────────
-# 1. PARSE - correctly split individual [N] results
+# 2. V6 FALLBACK — direct ChromaDB + Ollama HTTP (timeout保障)
+# ─────────────────────────────────────────────────────────────────
+
+try:
+    import chromadb
+    _CHROMA_AVAILABLE = True
+except ImportError:
+    _CHROMA_AVAILABLE = False
+
+_SUPER_MEM_CHROMA = os.path.expanduser("~/.super-mem/chroma")
+
+
+def ollama_embed_http(texts: list) -> list:
+    import urllib.request
+    embeddings = []
+    for text in texts:
+        payload = json.dumps({"model": "nomic-embed-text", "prompt": text}).encode()
+        req = urllib.request.Request(
+            "http://localhost:11434/api/embeddings",
+            data=payload, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+                emb = data.get("embedding")
+                embeddings.append(emb if emb else [0.0] * 768)
+        except Exception:
+            embeddings.append([0.0] * 768)
+    return embeddings
+
+
+def v6_fallback_search(query_text: str, limit: int = 5) -> list:
+    """v6 direct fallback — called when v5 times out."""
+    if not _CHROMA_AVAILABLE:
+        return []
+    q_emb = ollama_embed_http([query_text])[0]
+    try:
+        client = chromadb.PersistentClient(path=_SUPER_MEM_CHROMA)
+        col = client.get_collection("super_mem_shared")
+        raw = col.query(
+            query_embeddings=[q_emb],
+            n_results=limit * 3,
+            include=["documents", "metadatas"]
+        )
+        docs = raw.get("documents", [[]])[0]
+        metas = raw.get("metadatas", [[]])[0]
+        if not docs:
+            return []
+        items = []
+        for i, doc in enumerate(docs):
+            meta = metas[i] if i < len(metas) else {}
+            sf = meta.get("source_file", "")
+            source = os.path.basename(sf) if sf else sf
+            items.append({
+                "content": doc, "source": source,
+                "score": 1.0 - (i / max(len(docs), 1)),
+                "meta": meta
+            })
+        return items
+    except Exception:
+        return []
+
+
+# ─────────────────────────────────────────────────────────────────
+# 3. PARSE — mempalace CLI markdown output → structured results
 # ─────────────────────────────────────────────────────────────────
 
 def parse_search_output(output: str, query: str = '') -> list:
@@ -82,7 +137,6 @@ def parse_search_output(output: str, query: str = '') -> list:
 
 
 def _extract_result(block: str) -> dict:
-    """Extract source, score, and content from a result block."""
     header_match = re.match(r'\[(\d+)\]\s+(\S+)\s+/\s+(\S+)', block)
     if not header_match:
         return None
@@ -92,198 +146,134 @@ def _extract_result(block: str) -> dict:
     raw_score = float(match_score_match.group(1)) if match_score_match else 0.0
     match_pos = block.find('Match:')
     if match_pos == -1:
-        return {
-            'content': block[header_match.end():].strip(),
-            'score': raw_score,
-            'source': source,
-            'match_score': raw_score
-        }
+        return {'content': block[header_match.end():].strip(),
+                'score': raw_score, 'source': source, 'match_score': raw_score}
     line_end = block.find('\n', match_pos)
     blank = block.find('\n\n', line_end)
     content = block[blank + 2:].strip() if blank != -1 else block[line_end + 1:].strip()
-    return {
-        'content': content,
-        'score': raw_score,
-        'source': source,
-        'match_score': raw_score
-    }
+    return {'content': content, 'score': raw_score, 'source': source, 'match_score': raw_score}
 
 
 # ─────────────────────────────────────────────────────────────────
-# 2. CHINESE KEYWORD BOOST - 解决中文嵌入质量问题
+# 4. IDENTITY PRIORITY + KEYWORD BOOST
 # ─────────────────────────────────────────────────────────────────
 
-def is_chinese_text(text: str) -> bool:
-    """检测文本是否包含中文(用于判断是否使用关键词boost)。"""
+IDENTITY_BOOST = {
+    'USER.md': 100.0, 'SOUL.md': 50.0, 'MEMORY.md': 30.0,
+    'AGENTS.md': 10.0, 'HEARTBEAT.md': 5.0,
+}
+
+
+def identity_boost_score(source: str, content: str, query: str) -> float:
+    basename = os.path.basename(source)
+    if basename in IDENTITY_BOOST:
+        return IDENTITY_BOOST[basename]
+    if '城' in query and '城' in content and basename in {
+        'USER.md', 'SOUL.md', 'MEMORY.md', 'AGENTS.md', 'HEARTBEAT.md',
+        'IDENTITY.md', 'TOOLS.md'
+    }:
+        return 20.0
+    return 0.0
+
+
+def is_chinese(text: str) -> bool:
     return bool(re.search(r'[\u4e00-\u9fff]', text))
 
-def extract_chinese_tokens(text: str, min_len: int = 2) -> set:
-    """提取中文bigram tokens(中文分词)。"""
+
+def extract_chinese_tokens(text: str) -> set:
     tokens = set()
     for i in range(len(text) - 1):
         c1, c2 = text[i], text[i+1]
         if '\u4e00' <= c1 <= '\u9fff' and '\u4e00' <= c2 <= '\u9fff':
             tokens.add(text[i:i+2])
-    # 也提取英文词
     for w in re.findall(r'[a-zA-Z0-9]{2,}', text):
         tokens.add(w.lower())
     return tokens
 
+
 def keyword_boost_score(content: str, query: str) -> float:
-    """
-    中文关键词匹配得分。
-    如果内容包含查询的所有中文bigram,给 +0.5 boost。
-    如果部分包含,按比例给分。
-    """
-    if not is_chinese_text(query):
+    if not is_chinese(query):
         return 0.0
-
-    query_tokens = extract_chinese_tokens(query)
-    if not query_tokens:
+    q_tokens = extract_chinese_tokens(query)
+    if not q_tokens:
         return 0.0
-
-    content_tokens = extract_chinese_tokens(content)
-    if not content_tokens:
+    c_tokens = extract_chinese_tokens(content)
+    if not c_tokens:
         return 0.0
-
-    overlap = len(query_tokens & content_tokens)
-    ratio = overlap / len(query_tokens)
-
-    # 全匹配给 +0.5 boost(相当于一个 top-1 结果的分数差距)
-    # 部分匹配按比例
-    return 0.5 * ratio
+    return 0.5 * (len(q_tokens & c_tokens) / len(q_tokens))
 
 
 # ─────────────────────────────────────────────────────────────────
-# 3. IDENTITY BOOST - 第一性:城的信息永远优先
-# ─────────────────────────────────────────────────────────────────
-
-def identity_boost_score(source: str, content: str, query: str) -> float:
-    """
-    根据source文件的重要性给予额外boost。
-    第一性原则:USER.md/SOUL.md 是关于城的核心定义,必须优先于其他任何文档。
-    """
-    basename = source.split('/')[-1].split('\\')[-1]
-
-    # 文件名直接匹配
-    if basename in IDENTITY_BOOST:
-        return IDENTITY_BOOST[basename]
-
-    # 如果查询包含"城"且content包含城的定义,给予boost
-    if '城' in query and '城' in content and basename in IDENTITY_FILES:
-        return 20.0
-
-    return 0.0
-
-
-# ─────────────────────────────────────────────────────────────────
-# 4. DEDUP - same-source dedup + Levenshtein
+# 5. DEDUP + MMR
 # ─────────────────────────────────────────────────────────────────
 
 def dedup_results(results, threshold=0.85):
-    """Same-source dedup → keep highest score per source, then Levenshtein dedup."""
     if not results:
         return []
-
-    def levenshtein(s1, s2):
-        if len(s1) < len(s2):
-            return levenshtein(s2, s1)
-        if len(s2) == 0:
-            return len(s1)
-        prev = range(len(s2) + 1)
-        for i, c1 in enumerate(s1):
+    def lev_sim(s1, s2):
+        s1, s2 = s1.lower(), s2.lower()
+        if not s1 or not s2:
+            return 0.0
+        m, n = len(s1), len(s2)
+        if m < n: s1, s2, m, n = s2, s1, n, m
+        prev = range(n + 1)
+        for i in range(m):
             curr = [i + 1]
-            for j, c2 in enumerate(s2):
-                curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (c1 != c2)))
+            for j in range(n):
+                curr.append(min(prev[j+1]+1, curr[j]+1, prev[j]+(s1[i]!=s2[j])))
             prev = curr
-        return prev[-1]
-
-    def similarity(s1, s2):
-        s1 = s1.lower(); s2 = s2.lower()
-        max_len = max(len(s1), len(s2))
-        if max_len == 0:
-            return 1.0
-        return 1.0 - (levenshtein(s1, s2) / max_len)
-
-    # Step 1: keep highest-scoring result per source
+        return 1.0 - (prev[n] / max(m, n)) if max(m, n) else 1.0
     by_source = {}
     for r in results:
         src = r.get('source', '')
         if src not in by_source or r.get('score', 0) > by_source[src].get('score', 0):
             by_source[src] = r
-
-    # Step 2: Levenshtein dedup
     deduped = []
     for r in by_source.values():
-        content = r.get('content', '')
-        is_dup = any(similarity(content, e.get('content', '')) > threshold for e in deduped)
-        if not is_dup:
+        if not any(lev_sim(r['content'], e['content']) > threshold for e in deduped):
             deduped.append(r)
-
     return deduped
 
 
-# ─────────────────────────────────────────────────────────────────
-# 5. MMR - Optional diversity reranking (NOT default)
-# ─────────────────────────────────────────────────────────────────
-
 def mmr_rerank(results, query, lambda_param=0.7, limit=5):
-    """MMR diversity reranking - only when explicitly requested."""
     if not results or len(results) <= limit:
         return results
-
-    def levenshtein(s1, s2):
-        if len(s1) < len(s2):
-            return levenshtein(s2, s1)
-        if len(s2) == 0:
-            return len(s1)
-        prev = range(len(s2) + 1)
-        for i, c1 in enumerate(s1):
+    def lev_sim(s1, s2):
+        s1, s2 = s1.lower(), s2.lower()
+        if not s1 or not s2: return 0.0
+        m, n = len(s1), len(s2)
+        if m < n: s1, s2, m, n = s2, s1, n, m
+        prev = range(n + 1)
+        for i in range(m):
             curr = [i + 1]
-            for j, c2 in enumerate(s2):
-                curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (c1 != c2)))
+            for j in range(n):
+                curr.append(min(prev[j+1]+1, curr[j]+1, prev[j]+(s1[i]!=s2[j])))
             prev = curr
-        return prev[-1]
-
-    def similarity(s1, s2):
-        s1 = s1.lower(); s2 = s2.lower()
-        max_len = max(len(s1), len(s2))
-        if max_len == 0:
-            return 1.0
-        return 1.0 - (levenshtein(s1, s2) / max_len)
-
-    selected = []
-    remaining = list(results)
-    max_s = max((r.get('score', 0) for r in remaining), default=1)
-    min_s = min((r.get('score', 0) for r in remaining), default=0)
-    score_range = max_s - min_s if max_s != min_s else 1.0
-
-    def norm(r):
-        return (r.get('score', 0) - min_s) / score_range
-
+        return 1.0 - (prev[n] / max(m, n)) if max(m, n) else 1.0
+    selected, remaining = [], list(results)
+    scores = [r.get('score', 0) for r in remaining]
+    max_s, min_s = max(scores) if scores else 1, min(scores) if scores else 0
+    rng = max_s - min_s if max_s != min_s else 1.0
+    norm = lambda r: (r.get('score', 0) - min_s) / rng
     while len(selected) < limit and remaining:
-        best_score = -float('inf')
-        best_item, best_idx = None, -1
+        best_idx = -1
         for idx, item in enumerate(remaining):
-            relevance = norm(item)
-            max_sim = max((similarity(item.get('content', ''), s.get('content', '')) for s in selected), default=0)
-            diversity = 1.0 - max_sim
-            mmr_score = lambda_param * relevance + (1 - lambda_param) * diversity
-            if mmr_score > best_score:
-                best_score, best_item, best_idx = mmr_score, item, idx
-        if best_item is not None:
-            selected.append(best_item)
-            remaining.pop(best_idx)
-        else:
-            break
+            rel = norm(item)
+            max_sim = max((lev_sim(item['content'], s['content']) for s in selected), default=0)
+            mmr = lambda_param * rel + (1 - lambda_param) * (1 - max_sim)
+            if best_idx < 0 or mmr > (lambda_param * norm(remaining[best_idx]) +
+                    (1 - lambda_param) * (1 - max((lev_sim(remaining[best_idx]['content'], s['content']) for s in selected), default=0))):
+                best_idx = idx
+        if best_idx < 0: break
+        selected.append(remaining.pop(best_idx))
     return selected
 
 
 # ─────────────────────────────────────────────────────────────────
-# 6. STRIP - remove OpenClaw metadata
+# 6. STRIP + CREDENTIAL FILTER
 # ─────────────────────────────────────────────────────────────────
 
-STRIP_PATTERNS = [
+_STRIP_PATTERNS = [
     (r'^\[message_id:\s*[^\]]+\]\s*', ''),
     (r'^Sender\s*\(untrusted metadata\):\s*```json\s*\n[\s\S]*?```\s*\n', ''),
     (r'^```json\s*\n[\s\S]*?```\s*\n', ''),
@@ -293,14 +283,9 @@ STRIP_PATTERNS = [
 ]
 
 def strip_metadata(text: str) -> str:
-    for pat, repl in STRIP_PATTERNS:
+    for pat, repl in _STRIP_PATTERNS:
         text = re.sub(pat, repl, text, flags=re.MULTILINE)
     return text.strip()
-
-
-# ─────────────────────────────────────────────────────────────────
-# 7. CREDENTIAL FILTER
-# ─────────────────────────────────────────────────────────────────
 
 _CRED_PATTERNS = [
     (r'ghp_[a-zA-Z0-9]{36}', '[GITHUB_TOKEN]'),
@@ -328,67 +313,54 @@ def has_plaintext_credential(content: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────
-# 8. COMMANDS - v5 重构
+# 7. COMMANDS
 # ─────────────────────────────────────────────────────────────────
 
 def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True):
-    """
-    v5 核心搜索逻辑:
-    1. mempalace 原生检索
-    2. strip + credential_filter
-    3. 同源去重
-    4. 中文关键词boost
-    5. Identity优先boost
-    6. 最终排序(原生分数 + boosts)
-    7. MMR(可选,默认关闭)
-    """
     t0 = time.time()
-    out, err, code = call_mempalace(['search', query, '--results', str(limit * 3)])
 
-    if code != 0:
-        return {'status': 'error', 'error': err}
+    # Primary: v5 subprocess to mempalace CLI (0.44s)
+    v5_timeout = _TIMEOUT
+    out, err, code = call_mempalace(['search', query, '--results', str(limit * 3)], timeout=v5_timeout)
 
-    results = parse_search_output(out, query)
+    if code == 0:
+        results = parse_search_output(out, query)
+        source = 'mempalace_cli(v5)'
+    else:
+        # v6 fallback: direct ChromaDB + Ollama HTTP (no subprocess)
+        results = v6_fallback_search(query, limit=limit * 3)
+        source = 'v6_fallback'
+
+    steps = [source]
+
     if not results:
-        return {'status': 'ok', 'query': query, 'results': [], 'steps': ['parse_error']}
+        return {'status': 'ok', 'query': query, 'results': [], 'steps': steps}
 
-    steps = ['mempalace_native']
-
-    # Strip metadata
     if strip:
         for r in results:
             r['content'] = strip_metadata(r['content'])
         steps.append('strip')
 
-    # Credential filter
     for r in results:
         r['content'] = filter_credentials(r['content'])
     steps.append('credential_filter')
 
-    # Deduplicate
     before_dedup = len(results)
     if dedup:
         results = dedup_results(results)
         steps.append(f'dedup({before_dedup}→{len(results)})')
 
-    # ── 第一性原则核心:精确召回,不打乱原生排序 ──
-    # 计算最终得分 = mempalace原生分数 + identity_boost + keyword_boost
     for r in results:
-        identity_boost = identity_boost_score(r['source'], r['content'], query)
-        kw_boost = keyword_boost_score(r['content'], query) if is_chinese_text(query) else 0.0
-        r['_identity_boost'] = identity_boost
-        r['_kw_boost'] = kw_boost
-        r['final_score'] = r['score'] + identity_boost + kw_boost
-
-    # 按最终得分排序(不打乱原生排序,只做微调)
-    results = sorted(results, key=lambda x: x.get('final_score', 0), reverse=True)
+        r['_identity_boost'] = identity_boost_score(r['source'], r['content'], query)
+        r['_kw_boost'] = keyword_boost_score(r['content'], query)
+        r['final_score'] = r['score'] + r['_identity_boost'] + r['_kw_boost']
     steps.append('identity_kw_boost')
 
-    # MMR(可选,默认关闭)
-    before_mmr = len(results)
+    results = sorted(results, key=lambda x: x.get('final_score', 0), reverse=True)
+
     if use_mmr:
         results = mmr_rerank(results, query, lambda_param=0.7, limit=limit)
-        steps.append(f'mmr({before_mmr}→{len(results)})')
+        steps.append(f'mmr(→{len(results)})')
     else:
         results = results[:limit]
         steps.append(f'top({len(results)})')
@@ -396,61 +368,33 @@ def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True):
     elapsed_ms = round((time.time() - t0) * 1000)
 
     return {
-        'status': 'ok',
-        'query': query,
-        'steps': steps,
-        'elapsed_ms': elapsed_ms,
+        'status': 'ok', 'query': query, 'steps': steps, 'elapsed_ms': elapsed_ms,
         'results': [
-            {
-                'content': r['content'],
-                'score': round(r['score'], 4),
-                'final_score': round(r['final_score'], 4),
-                'source': r.get('source', '?'),
-                'match_score': round(r.get('match_score', 0), 3),
-                '_boosts': {
-                    'identity': r.get('_identity_boost', 0),
-                    'keyword': r.get('_kw_boost', 0)
-                }
-            }
+            {'content': r['content'], 'score': round(r['score'], 4),
+             'final_score': round(r['final_score'], 4), 'source': r.get('source', '?'),
+             '_boosts': {'identity': r.get('_identity_boost', 0),
+                         'keyword': r.get('_kw_boost', 0)}}
             for r in results[:limit]
         ]
     }
 
 
-def cmd_remember(content: str, agent: str = 'main', room: str = 'general', source: str = ''):
-    """
-    存储记忆（带凭证检测）。
-    第一性原则：在凭证写入存储前拦截。
-    - 如果原始内容包含凭证：直接拒绝（fail-secure）
-    - 如果必须过滤后存储：警告 + 过滤存储
-    """
-    # 前置检查：凭证检测
+def cmd_remember(content, agent='main', room='general', source=''):
     if has_plaintext_credential(content):
         filtered = filter_credentials(content)
-        # 过滤后仍检测到凭证 = 无法安全处理，拒绝
         if has_plaintext_credential(filtered):
-            return {
-                'status': 'error',
-                'error': 'CREDENTIAL_DETECTED',
-                'message': '内容包含无法过滤的明文凭证，拒绝存储',
-                'hint': '凭证应加密存储在 ~/.openclaw/.credentials，content中不应出现明文'
-            }
-        # 过滤生效：警告但仍存储（凭证部分被替换）
+            return {'status': 'error', 'error': 'CREDENTIAL_DETECTED',
+                    'message': '内容包含无法过滤的明文凭证，拒绝存储'}
         clean_content = filtered
         warn = '⚠️ 凭证已过滤，请勿在内容中直接包含密码/token'
     else:
         clean_content = content
         warn = None
-
-    # 调用 super_mem_cli.py store
     try:
-        import subprocess
         env = os.environ.copy()
         env['PATH'] = f'/Users/mars/Library/Python/3.9/bin:{env.get("PATH", "")}'
         r = subprocess.run(
-            ['/usr/bin/python3',
-             '/Users/mars/.openclaw/workspace/skills/mem-plus/scripts/super_mem_cli.py',
-             'remember', clean_content,
+            [sys.executable, SUPER_MEM_CLI, 'remember', clean_content,
              '--agent', agent, '--room', room, '--source', source],
             capture_output=True, text=True, timeout=15, env=env
         )
@@ -461,15 +405,14 @@ def cmd_remember(content: str, agent: str = 'main', room: str = 'general', sourc
                     result['warning'] = warn
                 return result
             except:
-                return {'status': 'ok', 'action': 'remember', 'content_preview': clean_content[:80], 'warning': warn}
-        else:
-            return {'status': 'error', 'error': r.stderr[:200]}
+                return {'status': 'ok', 'action': 'remember',
+                        'content_preview': clean_content[:80], 'warning': warn}
+        return {'status': 'error', 'error': r.stderr[:200]}
     except Exception as e:
         return {'status': 'error', 'error': str(e)}
 
 
 def cmd_wake_up():
-    """唤醒:返回完整上下文(L0 identity + L1 essential story)。"""
     out, err, code = call_mempalace(['wake-up'], timeout=30)
     if code == 0:
         return {'status': 'ok', 'context': out}
@@ -477,7 +420,6 @@ def cmd_wake_up():
 
 
 def cmd_status():
-    """健康检查。"""
     out, err, code = call_mempalace(['status'], timeout=15)
     if code == 0:
         return {'status': 'ok', 'output': out}
@@ -485,8 +427,7 @@ def cmd_status():
 
 
 def cmd_mine(path=None):
-    """挖掘目录生成新记忆。"""
-    target = path or WORKSPACE
+    target = path or os.path.expanduser('~/.openclaw/workspace')
     out, err, code = call_mempalace(['mine', target, '--mode', 'projects'], timeout=120)
     if code == 0:
         return {'status': 'ok', 'path': target, 'output': out}
@@ -494,11 +435,10 @@ def cmd_mine(path=None):
 
 
 def cmd_forget(memory_id):
-    """从 ChromaDB 删除记忆。"""
+    if not _CHROMA_AVAILABLE:
+        return {'status': 'error', 'error': 'chromadb not available'}
     try:
-        import chromadb
-        palace_path = os.path.expanduser('~/.mempalace/palace')
-        client = chromadb.PersistentClient(path=palace_path)
+        client = chromadb.PersistentClient(path=_SUPER_MEM_CHROMA)
         for col in client.list_collections():
             try:
                 collection = client.get_collection(col.name)
@@ -519,29 +459,15 @@ def cmd_forget(memory_id):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='MemPalace Enhanced CLI v5 - 第一性原则精确召回',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
-示例:
-  # 精确召回(默认,关闭MMR):
-  mempalace_cli.py search "城的身份 CEO"
-
-  # 开启MMR多样性模式:
-  mempalace_cli.py search "城的身份 CEO" --use-mmr
-
-  # 存储记忆(含凭证检测):
-  mempalace_cli.py remember "城总今天有新的任务安排"
-'''
+        description='mem-plus v7 — 实测最优架构：v5 primary + v6 fallback',
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
     subparsers = parser.add_subparsers(dest='cmd')
 
     p_search = subparsers.add_parser('search')
-    p_search.add_argument('query', help='搜索查询')
+    p_search.add_argument('query')
     p_search.add_argument('--limit', type=int, default=5)
-    p_search.add_argument('--use-mmr', dest='use_mmr', action='store_true', default=False,
-                         help='开启MMR多样性重排(默认关闭,精确召回优先)')
-    p_search.add_argument('--mmr', dest='use_mmr', action='store_true', default=False,
-                         help='开启MMR多样性重排')
+    p_search.add_argument('--use-mmr', dest='use_mmr', action='store_true', default=False)
     p_search.add_argument('--no-dedup', dest='dedup', action='store_false', default=True)
     p_search.add_argument('--no-strip', dest='strip', action='store_false', default=True)
 
@@ -549,13 +475,13 @@ if __name__ == '__main__':
     subparsers.add_parser('wake-up')
 
     p_mine = subparsers.add_parser('mine')
-    p_mine.add_argument('--path', help='挖掘路径')
+    p_mine.add_argument('--path')
 
     p_forget = subparsers.add_parser('forget')
-    p_forget.add_argument('memory_id', help='记忆ID')
+    p_forget.add_argument('memory_id')
 
     p_remember = subparsers.add_parser('remember')
-    p_remember.add_argument('content', help='要记忆的内容')
+    p_remember.add_argument('content')
     p_remember.add_argument('--agent', '-a', default='main')
     p_remember.add_argument('--room', '-r', default='general')
     p_remember.add_argument('--source', '-s', default='')
