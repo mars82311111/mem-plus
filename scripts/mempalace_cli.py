@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
-mem-plus v7 — 最优架构：第一性原则实测驱动
-============================================
-结论（实测）：
-  v5 (单 subprocess → mempalace CLI): 0.44s ← 更快
-  v6 (Python direct ChromaDB+Ollama): 2.52s ← Python开销抵消优化
+mem-plus v8 — SuperMem 精华合并版
+===================================
+从 SuperMem v7 提炼合并的精华功能：
+  1. exact_boost: 查询词精确出现在内容中 → +1.0 boost
+  2. temporal_decay: 时间衰减（权重0.1，不干扰identity）
+  3. filename detection: 查询像文件名时boost对应文档
+  4. ngram_jaccard n=3: trigram去重（比bigram更准）
 
-v7 选择：v5 架构为主 + v6 direct fallback 作为 timeout 保障
-
-subprocess 链：
-  hook → mempalace_cli.py → mempalace CLI subprocess → Ollama
-                    ↓ (on timeout/fail)
-              v6 fallback: direct ChromaDB + Ollama HTTP
-
-这样：
-  - 正常路径：走 mempalace CLI (0.44s)
-  - 超时 fallback：走 direct (2.5s，但保障可用性)
+架构不变（v7实测最优）：
+  - v5 subprocess to mempalace CLI (primary)
+  - v6 direct fallback (timeout > 3s)
+  - identity_boost + keyword_boost (from v5)
+  - credential_filter (from v4)
 """
 import sys
 import os
@@ -79,7 +76,6 @@ def ollama_embed_http(texts: list) -> list:
 
 
 def v6_fallback_search(query_text: str, limit: int = 5) -> list:
-    """v6 direct fallback — called when v5 times out."""
     if not _CHROMA_AVAILABLE:
         return []
     q_emb = ollama_embed_http([query_text])[0]
@@ -111,11 +107,10 @@ def v6_fallback_search(query_text: str, limit: int = 5) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────
-# 3. PARSE — mempalace CLI markdown output → structured results
+# 3. PARSE — mempalace CLI markdown → structured results
 # ─────────────────────────────────────────────────────────────────
 
 def parse_search_output(output: str, query: str = '') -> list:
-    """Parse mempalace CLI markdown output into structured results."""
     results = []
     blocks = re.split(r'\n\s*─{5,}\s*\n', output)
     for block in blocks:
@@ -155,7 +150,7 @@ def _extract_result(block: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────
-# 4. IDENTITY PRIORITY + KEYWORD BOOST
+# 4. IDENTITY PRIORITY + KEYWORD BOOST (from v5)
 # ─────────────────────────────────────────────────────────────────
 
 IDENTITY_BOOST = {
@@ -192,6 +187,7 @@ def extract_chinese_tokens(text: str) -> set:
 
 
 def keyword_boost_score(content: str, query: str) -> float:
+    """Chinese bigram keyword boost (from v5)."""
     if not is_chinese(query):
         return 0.0
     q_tokens = extract_chinese_tokens(query)
@@ -204,36 +200,101 @@ def keyword_boost_score(content: str, query: str) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────
-# 5. DEDUP + MMR
+# 5. SUPERMEM 精华功能 (NEW in v8)
+# ─────────────────────────────────────────────────────────────────
+
+def exact_boost_score(content: str, query: str) -> float:
+    """
+    SuperMem: if query appears verbatim in content, give +1.0 boost.
+    If all query terms appear, give +0.8.
+    Partial match: proportional boost.
+    """
+    q_lower = query.lower()
+    c_lower = content.lower()
+    if q_lower in c_lower:
+        return 1.0
+    terms = [t for t in query.split() if len(t) >= 2]
+    if not terms:
+        return 0.0
+    matched = sum(1 for t in terms if t.lower() in c_lower)
+    if matched == len(terms):
+        return 0.8
+    return 0.3 * (matched / len(terms))
+
+
+def filename_detection(query: str, content: str) -> float:
+    """
+    SuperMem: if query looks like a filename (short, no spaces, has capitals),
+    and content contains it as a markdown heading, boost.
+    """
+    if len(query) > 50 or ' ' in query.strip():
+        return 0.0
+    if not any(c.isupper() for c in query):
+        return 0.0
+    if re.search(rf'(?i)#\s*{re.escape(query)}\b', content):
+        return 2.0
+    return 0.0
+
+
+def temporal_decay(mtime: float, half_life: int = 30) -> float:
+    """
+    SuperMem: time decay. Newer documents get higher weight.
+    half_life=30 days: after 30 days, score *= 0.5
+    """
+    if not mtime or mtime <= 0:
+        return 0.5
+    days = (time.time() - float(mtime)) / 86400
+    return max(0.1, min(1.0, 0.5 ** (days / half_life)))
+
+
+def get_mtime_from_meta(meta: dict) -> float:
+    """Extract mtime from metadata, trying multiple field names."""
+    for field in ['filed_at', 'mtime', 'modified', 'updated', 'stored_at']:
+        val = meta.get(field)
+        if val:
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                pass
+    return 0.0
+
+
+def ngram_jaccard(s1: str, s2: str, n: int = 3) -> float:
+    """SuperMem: n-gram Jaccard similarity."""
+    def ngrams(s, n):
+        s = s.lower()
+        return set(s[i:i+n] for i in range(max(0, len(s)-n+1)))
+    a = ngrams(s1, n)
+    b = ngrams(s2, n)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b) if (a | b) else 0.0
+
+
+# ─────────────────────────────────────────────────────────────────
+# 6. DEDUP — ngram Jaccard (from SuperMem)
 # ─────────────────────────────────────────────────────────────────
 
 def dedup_results(results, threshold=0.85):
     if not results:
         return []
-    def lev_sim(s1, s2):
-        s1, s2 = s1.lower(), s2.lower()
-        if not s1 or not s2:
-            return 0.0
-        m, n = len(s1), len(s2)
-        if m < n: s1, s2, m, n = s2, s1, n, m
-        prev = range(n + 1)
-        for i in range(m):
-            curr = [i + 1]
-            for j in range(n):
-                curr.append(min(prev[j+1]+1, curr[j]+1, prev[j]+(s1[i]!=s2[j])))
-            prev = curr
-        return 1.0 - (prev[n] / max(m, n)) if max(m, n) else 1.0
+    # Step 1: keep highest-score per source
     by_source = {}
     for r in results:
         src = r.get('source', '')
         if src not in by_source or r.get('score', 0) > by_source[src].get('score', 0):
             by_source[src] = r
+    # Step 2: n-gram Jaccard dedup
     deduped = []
     for r in by_source.values():
-        if not any(lev_sim(r['content'], e['content']) > threshold for e in deduped):
+        if not any(ngram_jaccard(r['content'], e['content'], n=3) > threshold for e in deduped):
             deduped.append(r)
     return deduped
 
+
+# ─────────────────────────────────────────────────────────────────
+# 7. MMR (optional)
+# ─────────────────────────────────────────────────────────────────
 
 def mmr_rerank(results, query, lambda_param=0.7, limit=5):
     if not results or len(results) <= limit:
@@ -270,7 +331,7 @@ def mmr_rerank(results, query, lambda_param=0.7, limit=5):
 
 
 # ─────────────────────────────────────────────────────────────────
-# 6. STRIP + CREDENTIAL FILTER
+# 8. STRIP + CREDENTIAL FILTER
 # ─────────────────────────────────────────────────────────────────
 
 _STRIP_PATTERNS = [
@@ -313,21 +374,18 @@ def has_plaintext_credential(content: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────
-# 7. COMMANDS
+# 9. COMMANDS
 # ─────────────────────────────────────────────────────────────────
 
 def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True):
     t0 = time.time()
 
-    # Primary: v5 subprocess to mempalace CLI (0.44s)
-    v5_timeout = _TIMEOUT
-    out, err, code = call_mempalace(['search', query, '--results', str(limit * 3)], timeout=v5_timeout)
-
+    # Primary: v5 subprocess to mempalace CLI
+    out, err, code = call_mempalace(['search', query, '--results', str(limit * 3)], timeout=_TIMEOUT)
     if code == 0:
         results = parse_search_output(out, query)
         source = 'mempalace_cli(v5)'
     else:
-        # v6 fallback: direct ChromaDB + Ollama HTTP (no subprocess)
         results = v6_fallback_search(query, limit=limit * 3)
         source = 'v6_fallback'
 
@@ -350,11 +408,24 @@ def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True):
         results = dedup_results(results)
         steps.append(f'dedup({before_dedup}→{len(results)})')
 
+    # All boosts
+    TW = 0.1  # temporal weight: only 10%, won't override identity boost
     for r in results:
         r['_identity_boost'] = identity_boost_score(r['source'], r['content'], query)
         r['_kw_boost'] = keyword_boost_score(r['content'], query)
-        r['final_score'] = r['score'] + r['_identity_boost'] + r['_kw_boost']
-    steps.append('identity_kw_boost')
+        r['_exact_boost'] = exact_boost_score(r['content'], query)
+        r['_filename_boost'] = filename_detection(query, r['content'])
+        mtime = get_mtime_from_meta(r.get('meta', {}))
+        r['_temporal_decay'] = temporal_decay(mtime, half_life=30)
+        decay = r['_temporal_decay']
+        r['final_score'] = (
+            r['score'] * (1 - TW) + r['score'] * decay * TW
+            + r['_identity_boost']
+            + r['_kw_boost']
+            + r['_exact_boost']
+            + r['_filename_boost']
+        )
+    steps.append('boosts(exact+temporal+identity+kw+filename)')
 
     results = sorted(results, key=lambda x: x.get('final_score', 0), reverse=True)
 
@@ -370,10 +441,19 @@ def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True):
     return {
         'status': 'ok', 'query': query, 'steps': steps, 'elapsed_ms': elapsed_ms,
         'results': [
-            {'content': r['content'], 'score': round(r['score'], 4),
-             'final_score': round(r['final_score'], 4), 'source': r.get('source', '?'),
-             '_boosts': {'identity': r.get('_identity_boost', 0),
-                         'keyword': r.get('_kw_boost', 0)}}
+            {
+                'content': r['content'],
+                'score': round(r['score'], 4),
+                'final_score': round(r['final_score'], 4),
+                'source': r.get('source', '?'),
+                '_boosts': {
+                    'identity': r.get('_identity_boost', 0),
+                    'keyword': r.get('_kw_boost', 0),
+                    'exact': r.get('_exact_boost', 0),
+                    'filename': r.get('_filename_boost', 0),
+                    'temporal': round(r.get('_temporal_decay', 1), 3)
+                }
+            }
             for r in results[:limit]
         ]
     }
@@ -459,8 +539,15 @@ def cmd_forget(memory_id):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='mem-plus v7 — 实测最优架构：v5 primary + v6 fallback',
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description='mem-plus v8 — SuperMem 精华合并版',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+SuperMem 合并功能:
+  exact_boost: 查询词精确匹配 +1.0
+  temporal_decay: 时间衰减（权重0.1）
+  filename detection: 文件名查询 +2.0
+  ngram_jaccard n=3: trigram 去重
+'''
     )
     subparsers = parser.add_subparsers(dest='cmd')
 
