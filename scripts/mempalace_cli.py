@@ -261,6 +261,34 @@ def strip_metadata(text: str) -> str:
         text = re.sub(pat, repl, text, flags=re.MULTILINE)
     return text.strip()
 
+# ── CREDENTIAL FILTER ────────────────────────────────────────────
+_CRED_PATTERNS = [
+    # GitHub tokens
+    (r'ghp_[a-zA-Z0-9]{36}', '[GITHUB_TOKEN]'),
+    (r'gho_[a-zA-Z0-9]{36}', '[GITHUB_TOKEN]'),
+    (r'github_pat_[a-zA-Z0-9_]{22,}', '[GITHUB_TOKEN]'),
+    # Password patterns (5+ digits, not email addresses)
+    (r'(?<!\d)mars\d{5,}(?!\d)', '[PASSWORD]'),
+    (r'(?<!\d)Mars\d{5,}(?!\d)', '[PASSWORD]'),
+]
+_CRED_BLOCK_PATTERNS = [
+    r'ghp_[a-zA-Z0-9]{36}', r'gho_[a-zA-Z0-9]{36}',
+    r'(?<!\d)mars\d{5,}(?!\d)', r'(?<!\d)Mars\d{5,}(?!\d)',
+    r'(?i)(?:password|passwd|pwd|密码|secret|api_?key|token)\s*[:=]\s*[a-zA-Z0-9_\-]{4,}',
+]
+
+def filter_credentials(content: str) -> str:
+    """Replace known credential patterns with placeholders."""
+    for pat, repl in _CRED_PATTERNS:
+        content = re.sub(pat, repl, content)
+    return content
+
+def has_plaintext_credential(content: str) -> bool:
+    for pat in _CRED_BLOCK_PATTERNS:
+        if re.search(pat, content, re.IGNORECASE):
+            return True
+    return False
+
 
 # ─────────────────────────────────────────────────────────────────
 # 5. COMMANDS
@@ -286,6 +314,11 @@ def cmd_search(query, limit=5, use_mmr=True, dedup=True, strip=True):
         for r in results:
             r['content'] = strip_metadata(r['content'])
         steps.append('strip')
+    
+    # Filter credentials (applied after strip)
+    for r in results:
+        r['content'] = filter_credentials(r['content'])
+    steps.append('credential_filter')
     
     # Deduplicate (source dedup + Levenshtein)
     before_dedup = len(results)
