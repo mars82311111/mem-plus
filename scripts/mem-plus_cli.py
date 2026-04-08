@@ -11,8 +11,8 @@ mem-plus v8 — SuperMem 精华合并版
 架构不变（v7实测最优）：
   - v5 subprocess to mempalace CLI (primary)
   - v6 direct fallback (timeout > 3s)
-  - identity_boost + keyword_boost (from v5)
-  - credential_filter (from v4)
+  - identity_boost + keyword_boost (from v7)
+  - credential_filter (from v5)
 """
 import sys
 import os
@@ -26,7 +26,6 @@ import subprocess
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────
 MEMPALACE_CLI = '/Users/mars/Library/Python/3.9/bin/mempalace'
-SUPER_MEM_CLI = '/Users/mars/.openclaw/workspace/skills/mem-plus/scripts/super_mem_cli.py'
 _TIMEOUT = 3.0  # 秒，超时后用 v6 fallback
 
 # ─────────────────────────────────────────────────────────────────
@@ -150,7 +149,7 @@ def _extract_result(block: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────
-# 4. IDENTITY PRIORITY + KEYWORD BOOST (from v5)
+# 4. IDENTITY PRIORITY + KEYWORD BOOST (from v7)
 # ─────────────────────────────────────────────────────────────────
 
 IDENTITY_BOOST = {
@@ -187,7 +186,7 @@ def extract_chinese_tokens(text: str) -> set:
 
 
 def keyword_boost_score(content: str, query: str) -> float:
-    """Chinese bigram keyword boost (from v5)."""
+    """Chinese bigram keyword boost (from v7)."""
     if not is_chinese(query):
         return 0.0
     q_tokens = extract_chinese_tokens(query)
@@ -384,7 +383,7 @@ def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True):
     out, err, code = call_mempalace(['search', query, '--results', str(limit * 3)], timeout=_TIMEOUT)
     if code == 0:
         results = parse_search_output(out, query)
-        source = 'mempalace_cli(v5)'
+        source = 'mem-plus_cli(v8)'
     else:
         results = v6_fallback_search(query, limit=limit * 3)
         source = 'v6_fallback'
@@ -470,26 +469,30 @@ def cmd_remember(content, agent='main', room='general', source=''):
     else:
         clean_content = content
         warn = None
-    try:
-        env = os.environ.copy()
-        env['PATH'] = f'/Users/mars/Library/Python/3.9/bin:{env.get("PATH", "")}'
-        r = subprocess.run(
-            [sys.executable, SUPER_MEM_CLI, 'remember', clean_content,
-             '--agent', agent, '--room', room, '--source', source],
-            capture_output=True, text=True, timeout=15, env=env
-        )
-        if r.returncode == 0:
-            try:
-                result = json.loads(r.stdout)
-                if warn:
-                    result['warning'] = warn
-                return result
-            except:
-                return {'status': 'ok', 'action': 'remember',
-                        'content_preview': clean_content[:80], 'warning': warn}
-        return {'status': 'error', 'error': r.stderr[:200]}
-    except Exception as e:
-        return {'status': 'error', 'error': str(e)}
+    # remember: store directly in SuperMem ChromaDB via direct Python
+    import uuid
+    if _CHROMA_AVAILABLE:
+        try:
+            client = chromadb.PersistentClient(path=_SUPER_MEM_CHROMA)
+            col = client.get_or_create_collection("super_mem_shared")
+            emb = ollama_embed_http([clean_content])[0]
+            mid = f"mem_{uuid.uuid4().hex[:12]}"
+            col.add(
+                ids=[mid],
+                embeddings=[emb],
+                documents=[clean_content],
+                metadatas=[{
+                    "source_file": source or 'cli',
+                    "room": room,
+                    "agent": agent,
+                    "stored_at": str(time.time()),
+                    "mtime": str(time.time())
+                }]
+            )
+            return {'status': 'ok', 'action': 'remember', 'id': mid, 'warning': warn}
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
+    return {'status': 'error', 'error': 'chromadb not available'}
 
 
 def cmd_wake_up():
