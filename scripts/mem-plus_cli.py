@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-mem-plus v8 — SuperMem 精华合并版
+mem-plus v9 — SuperMem 精华合并版
 ===================================
 从 SuperMem v7 提炼合并的精华功能：
-  1. exact_boost: 查询词精确出现在内容中 → +1.0 boost
-  2. temporal_decay: 时间衰减（权重0.1，不干扰identity）
-  3. filename detection: 查询像文件名时boost对应文档
+  1. exact_boost: 查询词精确出现在内容中 → +2.0 boost（全词）/+1.5（所有词）/+0.5（部分）
+  2. temporal_decay: 时间衰减（权重可调，默认0.1，不干扰identity）
+  3. filename detection: 查询像文件名时boost对应文档 +2.0
   4. ngram_jaccard n=3: trigram去重（比bigram更准）
+  5. list-agents: 查看所有 agent 列表
+  6. mine+bridge: 索引后自动同步到 SuperMem ChromaDB
 
-架构不变（v7实测最优）：
+架构（v7实测最优）：
   - v5 subprocess to mempalace CLI (primary)
   - v6 direct fallback (timeout > 3s)
   - identity_boost + keyword_boost (from v7)
@@ -204,21 +206,21 @@ def keyword_boost_score(content: str, query: str) -> float:
 
 def exact_boost_score(content: str, query: str) -> float:
     """
-    SuperMem: if query appears verbatim in content, give +1.0 boost.
-    If all query terms appear, give +0.8.
-    Partial match: proportional boost.
+    SuperMem exact_boost: if query appears verbatim in content, give +2.0 boost.
+    If all query terms appear, give +1.5.
+    Partial match: proportional boost up to +0.5.
     """
     q_lower = query.lower()
     c_lower = content.lower()
     if q_lower in c_lower:
-        return 1.0
+        return 2.0
     terms = [t for t in query.split() if len(t) >= 2]
     if not terms:
         return 0.0
     matched = sum(1 for t in terms if t.lower() in c_lower)
     if matched == len(terms):
-        return 0.8
-    return 0.3 * (matched / len(terms))
+        return 1.5
+    return 0.5 * (matched / len(terms))
 
 
 def filename_detection(query: str, content: str) -> float:
@@ -376,7 +378,7 @@ def has_plaintext_credential(content: str) -> bool:
 # 9. COMMANDS
 # ─────────────────────────────────────────────────────────────────
 
-def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True):
+def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True, tw=0.1, hl=30):
     t0 = time.time()
 
     # Primary: v5 subprocess to mempalace CLI
@@ -408,14 +410,14 @@ def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True):
         steps.append(f'dedup({before_dedup}→{len(results)})')
 
     # All boosts
-    TW = 0.1  # temporal weight: only 10%, won't override identity boost
+    TW = tw  # temporal weight: tunable, default 10%, won't override identity boost
     for r in results:
         r['_identity_boost'] = identity_boost_score(r['source'], r['content'], query)
         r['_kw_boost'] = keyword_boost_score(r['content'], query)
         r['_exact_boost'] = exact_boost_score(r['content'], query)
         r['_filename_boost'] = filename_detection(query, r['content'])
         mtime = get_mtime_from_meta(r.get('meta', {}))
-        r['_temporal_decay'] = temporal_decay(mtime, half_life=30)
+        r['_temporal_decay'] = temporal_decay(mtime, half_life=hl)
         decay = r['_temporal_decay']
         r['final_score'] = (
             r['score'] * (1 - TW) + r['score'] * decay * TW
@@ -509,12 +511,64 @@ def cmd_status():
     return {'status': 'error', 'error': err}
 
 
-def cmd_mine(path=None):
+def cmd_list_agents():
+    """List all agents that have memory collections."""
+    if not _CHROMA_AVAILABLE:
+        return {'status': 'error', 'error': 'chromadb not available'}
+    try:
+        client = chromadb.PersistentClient(path=_SUPER_MEM_CHROMA)
+        cols = client.list_collections()
+        agents = sorted(
+            c.name.replace('super_mem_', '')
+            for c in cols
+            if c.name.startswith('super_mem_') and c.name != 'super_mem_shared'
+        )
+        return {'status': 'ok', 'agents': agents, 'total': len(agents)}
+    except Exception as e:
+        return {'status': 'error', 'error': str(e)}
+
+
+def _bridge_sync() -> dict:
+    """Sync MemPalace drawers → SuperMem ChromaDB."""
+    if not _CHROMA_AVAILABLE:
+        return {'error': 'chromadb not available'}
+    try:
+        import chromadb
+        mp = chromadb.PersistentClient(path=os.path.expanduser('~/.mempalace/palace'))
+        mp_col = mp.get_collection('mempalace_drawers')
+        items = mp_col.get(limit=10000, include=['documents', 'metadatas'])
+        if not items['ids']:
+            return {'synced': 0, 'note': 'MemPalace empty'}
+        shared = chromadb.PersistentClient(path=_SUPER_MEM_CHROMA)
+        sc = shared.get_or_create_collection('super_mem_shared', metadata={'shared': 'true'})
+        old_ids = [mid for mid in sc.get(limit=10000, include=[])['ids']
+                   if mid.startswith('mp_') and not mid.startswith('mp_bridge_')]
+        if old_ids:
+            sc.delete(ids=old_ids)
+        docs, metas, ids = [], [], []
+        for i, did in enumerate(items['ids']):
+            doc = items['documents'][i] if items['documents'] else ''
+            meta = items['metadatas'][i] if items['metadatas'] else {}
+            docs.append(filter_credentials(doc))
+            metas.append({**meta, 'source': 'mem-plus_bridge', 'original_id': did})
+            ids.append(f'mp_bridge_{did}')
+        embs = ollama_embed_http(docs)
+        sc.add(documents=docs, metadatas=metas, ids=ids, embeddings=embs)
+        return {'synced': len(docs), 'deleted_old': len(old_ids)}
+    except Exception as e:
+        return {'error': str(e)}
+
+
+def cmd_mine(path=None, do_bridge=True):
     target = path or os.path.expanduser('~/.openclaw/workspace')
     out, err, code = call_mempalace(['mine', target, '--mode', 'projects'], timeout=120)
-    if code == 0:
-        return {'status': 'ok', 'path': target, 'output': out}
-    return {'status': 'error', 'error': err}
+    if code != 0:
+        return {'status': 'error', 'error': err}
+    result = {'status': 'ok', 'path': target, 'output': out}
+    if do_bridge:
+        sync = _bridge_sync()
+        result['bridge_sync'] = sync
+    return result
 
 
 def cmd_forget(memory_id):
@@ -560,6 +614,17 @@ SuperMem 合并功能:
     p_search.add_argument('--use-mmr', dest='use_mmr', action='store_true', default=False)
     p_search.add_argument('--no-dedup', dest='dedup', action='store_false', default=True)
     p_search.add_argument('--no-strip', dest='strip', action='store_false', default=True)
+    p_search.add_argument('--tw', type=float, default=0.1, help='temporal weight (0.0-1.0, default 0.1)')
+    p_search.add_argument('--hl', type=int, default=30, help='temporal half-life in days (default 30)')
+
+    subparsers.add_parser('status')
+    subparsers.add_parser('wake-up')
+    subparsers.add_parser('list-agents')
+
+    p_mine = subparsers.add_parser('mine')
+    p_mine.add_argument('--path')
+    p_mine.add_argument('--no-bridge', dest='bridge', action='store_false', default=True,
+                        help='skip sync to SuperMem ChromaDB after mining')
 
     subparsers.add_parser('status')
     subparsers.add_parser('wake-up')
@@ -579,7 +644,7 @@ SuperMem 合并功能:
     args = parser.parse_args()
 
     if args.cmd == 'search':
-        result = cmd_search(args.query, args.limit, args.use_mmr, args.dedup, args.strip)
+        result = cmd_search(args.query, args.limit, args.use_mmr, args.dedup, args.strip, tw=args.tw, hl=args.hl)
     elif args.cmd == 'remember':
         result = cmd_remember(args.content, args.agent, args.room, args.source)
     elif args.cmd == 'status':
@@ -587,7 +652,11 @@ SuperMem 合并功能:
     elif args.cmd == 'wake-up':
         result = cmd_wake_up()
     elif args.cmd == 'mine':
-        result = cmd_mine(args.path)
+        result = cmd_mine(args.path, do_bridge=args.bridge)
+    elif args.cmd == 'list-agents':
+        result = cmd_list_agents()
+    elif args.cmd == 'remember':
+        result = cmd_remember(args.content, args.agent, args.room, args.source)
     elif args.cmd == 'forget':
         result = cmd_forget(args.memory_id)
     else:
