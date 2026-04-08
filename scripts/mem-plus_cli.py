@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-mem-plus v9 — SuperMem 精华合并版
+mem-plus v10 — MemPalace wing/room 集成版
 ===================================
-从 SuperMem v7 提炼合并的精华功能：
-  1. exact_boost: 查询词精确出现在内容中 → +2.0 boost（全词）/+1.5（所有词）/+0.5（部分）
-  2. temporal_decay: 时间衰减（权重可调，默认0.1，不干扰identity）
-  3. filename detection: 查询像文件名时boost对应文档 +2.0
-  4. ngram_jaccard n=3: trigram去重（比bigram更准）
-  5. list-agents: 查看所有 agent 列表
-  6. mine+bridge: 索引后自动同步到 SuperMem ChromaDB
+v10 新功能（来自 mempalace CLI 深度扫描）：
+  search --wing <project>: 项目级过滤召回
+  search --room <room>: 房间级过滤召回（需先指定 --wing）
+  wake-up --wing <project>: 项目级上下文唤醒
+
+v9 功能（来自 SuperMem 精华合并）：
+  exact_boost: 全词2.0 / 所有词1.5 / 部分词0.5
+  --tw --hl: 可调 temporal 参数
+  list-agents: 查看 agent 列表
+  mine+bridge: 索引后同步 SuperMem DB
 
 架构（v7实测最优）：
   - v5 subprocess to mempalace CLI (primary)
@@ -378,14 +381,19 @@ def has_plaintext_credential(content: str) -> bool:
 # 9. COMMANDS
 # ─────────────────────────────────────────────────────────────────
 
-def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True, tw=0.1, hl=30):
+def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True, tw=0.1, hl=30, wing=None, room=None):
     t0 = time.time()
 
-    # Primary: v5 subprocess to mempalace CLI
-    out, err, code = call_mempalace(['search', query, '--results', str(limit * 3)], timeout=_TIMEOUT)
+    # Primary: v5 subprocess to mempalace CLI (with optional wing/room filtering)
+    mp_args = ['search', query, '--results', str(limit * 3)]
+    if wing:
+        mp_args.extend(['--wing', wing])
+    if room:
+        mp_args.extend(['--room', room])
+    out, err, code = call_mempalace(mp_args, timeout=_TIMEOUT)
     if code == 0:
         results = parse_search_output(out, query)
-        source = 'mem-plus_cli(v8)'
+        source = 'mem-plus_cli(v10)'
     else:
         results = v6_fallback_search(query, limit=limit * 3)
         source = 'v6_fallback'
@@ -497,10 +505,13 @@ def cmd_remember(content, agent='main', room='general', source=''):
     return {'status': 'error', 'error': 'chromadb not available'}
 
 
-def cmd_wake_up():
-    out, err, code = call_mempalace(['wake-up'], timeout=30)
+def cmd_wake_up(wing=None):
+    args = ['wake-up']
+    if wing:
+        args.extend(['--wing', wing])
+    out, err, code = call_mempalace(args, timeout=30)
     if code == 0:
-        return {'status': 'ok', 'context': out}
+        return {'status': 'ok', 'context': out, 'wing': wing}
     return {'status': 'error', 'error': err}
 
 
@@ -596,14 +607,13 @@ def cmd_forget(memory_id):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='mem-plus v8 — SuperMem 精华合并版',
+        description='mem-plus v10 — MemPalace wing/room 集成版',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
-SuperMem 合并功能:
-  exact_boost: 查询词精确匹配 +1.0
-  temporal_decay: 时间衰减（权重0.1）
-  filename detection: 文件名查询 +2.0
-  ngram_jaccard n=3: trigram 去重
+        epilog='''mem-plus v10 新功能:
+  search --wing <project> --room <room>: 项目+房间双重过滤召回
+  wake-up --wing <project>: 项目级上下文唤醒
+  exact_boost: 全词2.0 / 所有词1.5 / 部分词0.5
+  --tw --hl: 可调 temporal 参数
 '''
     )
     subparsers = parser.add_subparsers(dest='cmd')
@@ -614,23 +624,21 @@ SuperMem 合并功能:
     p_search.add_argument('--use-mmr', dest='use_mmr', action='store_true', default=False)
     p_search.add_argument('--no-dedup', dest='dedup', action='store_false', default=True)
     p_search.add_argument('--no-strip', dest='strip', action='store_false', default=True)
-    p_search.add_argument('--tw', type=float, default=0.1, help='temporal weight (0.0-1.0, default 0.1)')
-    p_search.add_argument('--hl', type=int, default=30, help='temporal half-life in days (default 30)')
+    p_search.add_argument('--tw', type=float, default=0.1)
+    p_search.add_argument('--hl', type=int, default=30)
+    p_search.add_argument('--wing', default=None)
+    p_search.add_argument('--room', default=None)
 
     subparsers.add_parser('status')
-    subparsers.add_parser('wake-up')
+
+    p_wakeup = subparsers.add_parser('wake-up')
+    p_wakeup.add_argument('--wing', default=None)
+
     subparsers.add_parser('list-agents')
 
     p_mine = subparsers.add_parser('mine')
     p_mine.add_argument('--path')
-    p_mine.add_argument('--no-bridge', dest='bridge', action='store_false', default=True,
-                        help='skip sync to SuperMem ChromaDB after mining')
-
-    subparsers.add_parser('status')
-    subparsers.add_parser('wake-up')
-
-    p_mine = subparsers.add_parser('mine')
-    p_mine.add_argument('--path')
+    p_mine.add_argument('--no-bridge', dest='bridge', action='store_false', default=True)
 
     p_forget = subparsers.add_parser('forget')
     p_forget.add_argument('memory_id')
@@ -644,13 +652,13 @@ SuperMem 合并功能:
     args = parser.parse_args()
 
     if args.cmd == 'search':
-        result = cmd_search(args.query, args.limit, args.use_mmr, args.dedup, args.strip, tw=args.tw, hl=args.hl)
-    elif args.cmd == 'remember':
-        result = cmd_remember(args.content, args.agent, args.room, args.source)
+        result = cmd_search(args.query, args.limit, args.use_mmr, args.dedup,
+                            args.strip, tw=args.tw, hl=args.hl,
+                            wing=args.wing, room=args.room)
+    elif args.cmd == 'wake-up':
+        result = cmd_wake_up(wing=args.wing)
     elif args.cmd == 'status':
         result = cmd_status()
-    elif args.cmd == 'wake-up':
-        result = cmd_wake_up()
     elif args.cmd == 'mine':
         result = cmd_mine(args.path, do_bridge=args.bridge)
     elif args.cmd == 'list-agents':
