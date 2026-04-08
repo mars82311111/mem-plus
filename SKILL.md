@@ -1,32 +1,98 @@
-# MemPalace Memory Skill (Enhanced v4)
+# MemPalace Memory Skill v5 — 第一性原则精确召回
 
-基于 **MemPalace**（22k⭐ · Benchmark 最高分）融合 SuperMem 增强层的记忆系统。
+基于 **MemPalace**（22k⭐ · Benchmark 最高分）融合 SuperMem 增强层。
 
 ---
 
-## 系统架构（第一性原理）
+## 核心理念（第一性原则）
+
+**问题本质**：当城问我任何问题时，我需要准确知道他的身份、偏好、原则、进行中的项目。
+**核心需求**：**确定性精确召回** >> 多样性探索
+
+vs 传统 RAG 系统：需要多样性（搜索引擎场景）→ MMR 默认开启
+我们的场景：个人 AI 助手 → **精确召回优先**，MMR 可选
+
+---
+
+## v5 架构（vs v4 的本质区别）
 
 ```
 用户消息
   ↓
-[Hook] message:preprocessed
+message:preprocessed (hook.ts)
   ↓
-mempalace_cli.py  ← 修复后版本（v4）
-  ↓ (call /Users/mars/Library/Python/3.9/bin/mempalace)
-MemPalace 原生检索
+mempalace_cli.py search
   ↓
-Levenshtein 去重（>85%相似度）
+mempalace 底层检索（15条原始结果）
   ↓
-MMR 多样性重排（λ=0.7）
+strip_metadata() — 清除 OpenClaw 元数据
   ↓
-注入 bodyForAgent → 模型响应
+filter_credentials() — 凭证过滤
+  ↓
+dedup_results() — 同源去重 + Levenshtein
+  ↓
+identity_kw_boost() ← v5 新增
+  • identity_boost: USER.md(+100), SOUL.md(+50), MEMORY.md(+30), AGENTS.md(+10)
+  • keyword_boost: 中文bigram精确匹配（解决中文嵌入质量问题）
+  ↓
+最终排序（原生分数 + boosts，不打乱）
+  ↓
+可选: mmr_rerank() — 默认关闭
+  ↓
+注入 bodyForAgent
 ```
 
-**关键修复（v4）**：
-- ✅ Hook 正确调用 `mempalace_cli.py`（之前错误调用 `super_mem_cli.py`）
-- ✅ 移除不存在的 `--no-exact` 参数
-- ✅ MMR + 去重 + 清洗 全部启用
-- ✅ 删除遗留的 `super_mem_cli.py` 调用
+---
+
+## 第一性原则设计决策
+
+| 决策 | v4 | v5 | 原因 |
+|------|----|----|------|
+| MMR | 默认开启 | 默认关闭 | 个人助手需要确定性，不是RAG |
+| 身份优先 | 无 | USER.md +100分 | 城的信息必须随时可用 |
+| 中文语义 | 纯向量 | 向量 + Bigram boost | nomic-embed-text 中文质量有限 |
+| 凭证存储 | 被动过滤 | 前置检测 + 过滤 + 警告 | fail-secure |
+
+---
+
+## CLI 命令
+
+```bash
+# 精确召回（默认，关闭MMR）
+mempalace_cli.py search "城的身份 CEO"
+
+# 开启MMR多样性模式（显式）
+mempalace_cli.py search "城的身份 CEO" --use-mmr
+
+# 存储记忆（含凭证检测）
+mempalace_cli.py remember "城总今天有新任务"
+
+# 检查状态
+mempalace_cli.py status
+
+# 唤醒上下文
+mempalace_cli.py wake-up
+
+# 挖掘新记忆
+mempalace_cli.py mine --path ~/.openclaw/workspace
+```
+
+---
+
+## 增强层功能
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| Hook 自动召回 | ✅ v4修复 | message:preprocessed 触发 |
+| 解析函数 | ✅ v4修复 | 正确分割 [N] 结果 |
+| 同源去重 | ✅ | SKILL.md 不再重复 |
+| identity 优先注入 | ✅ v5新增 | USER.md 永远第一 |
+| 中文 Bigram boost | ✅ v5新增 | 解决中文嵌入差问题 |
+| MMR 多样性 | ✅ 可选 | `--use-mmr` 显式开启 |
+| 凭证过滤 | ✅ | ghp_ / mars*** → 占位符 |
+| 存储前凭证检测 | ✅ v5新增 | fail-secure |
+| 元数据剥离 | ✅ | [message_id:] 等完全清除 |
+| ChromaDB forget | ✅ | 删除特定记忆 |
 
 ---
 
@@ -34,55 +100,16 @@ MMR 多样性重排（λ=0.7）
 
 | 文件 | 作用 |
 |------|------|
-| `scripts/mempalace_cli.py` | 增强CLI（MMR+去重+清洗）← 召回入口 |
-| `scripts/mempalace_reranker.py` | MMR重排+Levenshtein去重+元数据剥离 |
-| `scripts/super_mem_cli.py` | SuperMem层（ChromaDB bridge，不用于hook） |
-| `hook.ts` | OpenClaw hook处理器 |
-
----
-
-## CLI 命令
-
-```bash
-# 增强搜索（MMR + 去重 + 清洗）— 召回链路入口
-/usr/bin/python3 ~/.openclaw/workspace/skills/mempalace-memory/scripts/mempalace_cli.py search "查询" --limit 5
-
-# 状态检查
-/usr/bin/python3 ~/.openclaw/workspace/skills/mempalace-memory/scripts/mempalace_cli.py status
-
-# 唤醒（启动上下文）
-/usr/bin/python3 ~/.openclaw/workspace/skills/mempalace-memory/scripts/mempalace_cli.py wake-up
-
-# 增量挖掘
-/usr/bin/python3 ~/.openclaw/workspace/skills/mempalace-memory/scripts/mempalace_cli.py mine
-
-# 删除记忆（ChromaDB forget）
-/usr/bin/python3 ~/.openclaw/workspace/skills/mempalace-memory/scripts/mempalace_cli.py forget <memory_id>
-```
-
----
-
-## 增强层详情
-
-| 功能 | 实现 | 状态 |
-|------|------|------|
-| 自动 hook 注入 | `message:preprocessed` | ✅ v4修复 |
-| MMR 多样性重排 | `mempalace_reranker.py` | ✅ |
-| Levenshtein 去重 | `mempalace_reranker.py` (>85%) | ✅ |
-| 元数据清洗 | `mempalace_reranker.py` | ✅ |
-| ChromaDB forget | `mempalace_cli.py` | ✅ |
-| BM25+向量混合搜索 | MemPalace 原生 | ✅ |
-| 4层记忆栈 | MemPalace 原生 | ✅ |
-| Palaces Graph | MemPalace 原生 | ✅ |
-| SuperMem bridge | `super_mem_cli.py bridge` | ✅ 可选 |
+| `scripts/mempalace_cli.py` | v5 召回引擎入口（19KB） |
+| `scripts/mempalace_reranker.py` | MMR + Levenshtein 去重 |
+| `scripts/super_mem_cli.py` | SuperMem bridge（独立层） |
 
 ---
 
 ## 数据存储
 
-- **MemPalace 原生**：`~/.mempalace/palace/`（387 drawers，事实来源）
-- **SuperMem ChromaDB**：`~/.super-mem/chroma/`（通过bridge同步，可选层）
-- **Hook 注册**：`~/.openclaw/hooks/mempalace-recall/handler.ts`
+- **MemPalace 原生**：`~/.mempalace/palace/`（387 drawers）
+- **SuperMem ChromaDB**：`~/.super-mem/chroma/`（可选层）
 
 ---
 
@@ -91,28 +118,23 @@ MMR 多样性重排（λ=0.7）
 - Python 3.9+
 - Node.js
 - MemPalace CLI：`/Users/mars/Library/Python/3.9/bin/mempalace`
-- Ollama（用于向量嵌入）：`nomic-embed-text` 模型
-
----
-
-## 注意事项
-
-1. **Hook 入口**：`~/.openclaw/hooks/mempalace-recall/handler.ts` 是 OpenClaw 加载的唯一文件（不是 `hook.ts`）
-2. **SuperMem 是可选层**：`super_mem_cli.py` 可独立使用，但不通过 hook 调用
-3. **身份文件**：`~/.mempalace/identity.txt` 控制 wake-up 的 L0 层
-4. **使用 `trash > rm`** 保护数据
+- Ollama：`nomic-embed-text` 模型
 
 ---
 
 ## 更新日志
 
-### v4 (2026-04-08)
-- **FIX**: Hook 调用 `mempalace_cli.py`（之前错误调用 `super_mem_cli.py`）
-- **FIX**: 移除不存在的 `--no-exact` 参数
-- **FIX**: MMR + 去重 + 清洗 全部启用
-- **CLEAN**: 删除 `BOOTSTRAP.md`
-- **ADD**: 创建 `~/.mempalace/identity.txt`
-- **ADD**: 完整第一性原理架构文档
+### v5 (2026-04-08) — 第一性原则重构
+- **FEAT**: identity_boost — USER.md(+100), SOUL.md(+50) 永远优先
+- **FEAT**: keyword_boost — 中文 Bigram 精确匹配解决中文嵌入差问题
+- **FEAT**: MMR 默认关闭 — 精确召回优先
+- **FEAT**: remember 前置凭证检测 — fail-secure
+- **FIX**: credential filter 增强 — mars\d{5,} → [PASSWORD]
 
-### v3 (历史版本)
-- SuperMem v4 pure search（已废弃）
+### v4 (2026-04-08) — 召回链路修复
+- **FIX**: hook.ts → 正确 CLI（移除无效参数）
+- **FIX**: parse_search_output → 正确分割 [N] 结果
+- **FIX**: 同源去重 → SKILL.md 不再出现多次
+
+### v3 及之前
+- 早期混合架构（已废弃）
