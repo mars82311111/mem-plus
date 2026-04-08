@@ -449,7 +449,7 @@ def cmd_remember(content: str, agent: str = 'main', room: str = 'general', sourc
         env['PATH'] = f'/Users/mars/Library/Python/3.9/bin:{env.get("PATH", "")}'
         r = subprocess.run(
             ['/usr/bin/python3',
-             '/Users/mars/.openclaw/workspace/skills/mempalace-memory/scripts/super_mem_cli.py',
+             '/Users/mars/.openclaw/workspace/skills/mem-plus/scripts/super_mem_cli.py',
              'remember', clean_content,
              '--agent', agent, '--room', room, '--source', source],
             capture_output=True, text=True, timeout=15, env=env

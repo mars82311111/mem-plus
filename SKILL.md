@@ -1,6 +1,6 @@
-# MemPalace Memory Skill v5 — 第一性原则精确召回
+# mem-plus v5 — 第一性原则精确召回
 
-基于 **MemPalace**（22k⭐ · Benchmark 最高分）融合 SuperMem 增强层。
+基于 **mem-plus**（22k⭐ · Benchmark 最高分）融合 SuperMem 增强层。
 
 ---
 
@@ -108,7 +108,7 @@ mempalace_cli.py mine --path ~/.openclaw/workspace
 
 ## 数据存储
 
-- **MemPalace 原生**：`~/.mempalace/palace/`（387 drawers）
+- **mem-plus 原生**：`~/.mempalace/palace/`（387 drawers）
 - **SuperMem ChromaDB**：`~/.super-mem/chroma/`（可选层）
 
 ---
@@ -117,7 +117,7 @@ mempalace_cli.py mine --path ~/.openclaw/workspace
 
 - Python 3.9+
 - Node.js
-- MemPalace CLI：`/Users/mars/Library/Python/3.9/bin/mempalace`
+- mem-plus CLI：`/Users/mars/Library/Python/3.9/bin/mempalace`
 - Ollama：`nomic-embed-text` 模型
 
 ---
