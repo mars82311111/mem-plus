@@ -739,7 +739,7 @@ def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True, tw=0.1, hl
     }
 
 
-def cmd_remember(content, agent='main', room='general', source='', domain=None):
+def cmd_remember(content, agent='main', room='general', source='', domain=None, shared=False):
     if has_plaintext_credential(content):
         filtered = filter_credentials(content)
         if has_plaintext_credential(filtered):
@@ -757,7 +757,7 @@ def cmd_remember(content, agent='main', room='general', source='', domain=None):
     if _CHROMA_AVAILABLE:
         try:
             client = chromadb.PersistentClient(path=_MEM_CHROMA)
-            coll_name = _get_collection_name(domain=domain, agent=agent, scope='private')
+            coll_name = _get_collection_name(domain=domain, agent=agent, scope='shared' if shared else 'private')
             emb = ollama_embed_http([clean_content])[0]
             new_dim = len(emb)
             
@@ -1084,6 +1084,7 @@ if __name__ == '__main__':
     p_remember.add_argument('--room', '-r', default='general')
     p_remember.add_argument('--source', '-s', default='')
     p_remember.add_argument('--domain', '-d', default=None)
+    p_remember.add_argument('--shared', action='store_true', default=False, help='Write to Domain Shared collection (domain_{name}_shared) instead of private')
 
     args = parser.parse_args()
 
@@ -1106,7 +1107,7 @@ if __name__ == '__main__':
         result = cmd_promote(args.memory_id, args.from_domain, args.from_agent,
                                to_global=args.to_global, to_domain=args.to_domain)
     elif args.cmd == 'remember':
-        result = cmd_remember(args.content, args.agent, args.room, args.source, domain=args.domain)
+        result = cmd_remember(args.content, args.agent, args.room, args.source, domain=args.domain, shared=args.shared)
     elif args.cmd == 'forget':
         result = cmd_forget(args.memory_id, domain=args.domain, agent=args.agent)
     else:
