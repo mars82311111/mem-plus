@@ -896,10 +896,14 @@ def cmd_list_domains(verbose=False):
 def cmd_promote(memory_id, from_domain, from_agent, to_global=False, to_domain=None):
     """Promote a memory: Private → Domain Shared → Global Shared.
     
-    --to-global: promote to Global Shared (mempalace)
-    --to-domain <name>: promote to Domain Shared (domain_<name>_shared)
+    --to-global: promote to Global Shared (write to mempalace ChromaDB directly)
+    --to-domain <name>: promote to Domain Shared (domain_<name>_shared, auto-creates _v2 if dim mismatch)
     
     One of --to-global or --to-domain must be specified.
+    
+    FIX v11.1: 
+    - to_global: write directly to mempalace ChromaDB, don't use non-existent CLI
+    - to_domain: auto-create _v2 collection if dimension mismatch detected
     """
     if not _CHROMA_AVAILABLE:
         return {'status': 'error', 'error': 'chromadb not available'}
@@ -918,20 +922,74 @@ def cmd_promote(memory_id, from_domain, from_agent, to_global=False, to_domain=N
             return {'status': 'error', 'error': 'memory not found'}
         doc = items['documents'][0] if items['documents'] else ''
         meta = items['metadatas'][0] if items['metadatas'] else {}
+        emb = ollama_embed_http([doc])[0]
+        new_dim = len(emb)
+        
         if to_global:
-            out, err, code = call_mempalace(['remember', doc], timeout=30)
-            if code != 0:
-                return {'status': 'error', 'error': err}
-            from_col.delete(ids=[memory_id])
-            return {'status': 'ok', 'action': 'promoted', 'from': from_coll_name, 'to': 'mempalace(global)'}
+            # FIX: Write directly to mempalace ChromaDB at ~/.mempalace/palace
+            # Don't use call_mempalace CLI (no 'remember' subcommand exists)
+            try:
+                mp_client = chromadb.PersistentClient(path=os.path.expanduser('~/.mempalace/palace'))
+                mp_col = mp_client.get_or_create_collection('mempalace_drawers')
+                # Check for dim mismatch and create versioned collection if needed
+                def try_write_mp(coll, target_name=None):
+                    try:
+                        coll.add(
+                            ids=[f'mp_promoted_{memory_id}'],
+                            embeddings=[emb],
+                            documents=[doc],
+                            metadatas=[{**meta, 'promoted_from': from_coll_name}]
+                        )
+                        return True
+                    except Exception as write_err:
+                        if 'dimension' in str(write_err).lower():
+                            vname = target_name + '_v2' if target_name else 'mempalace_drawers_v2'
+                            v2_col = mp_client.get_or_create_collection(vname)
+                            v2_col.add(
+                                ids=[f'mp_promoted_{memory_id}'],
+                                embeddings=[emb],
+                                documents=[doc],
+                                metadatas=[{**meta, 'promoted_from': from_coll_name}]
+                            )
+                            return True
+                        raise
+                try_write_mp(mp_col)
+                from_col.delete(ids=[memory_id])
+                return {'status': 'ok', 'action': 'promoted', 'from': from_coll_name, 'to': 'mempalace_drawers'}
+            except Exception as mp_err:
+                return {'status': 'error', 'error': f'promote to global failed: {mp_err}'}
         else:
+            # Promote to Domain Shared — handle dimension mismatch like cmd_remember does
             to_coll = _get_collection_name(domain=to_domain, scope='shared')
-            to_col = client.get_or_create_collection(to_coll)
-            emb = ollama_embed_http([doc])[0]
-            to_col.add(ids=[f'promoted_{memory_id}'], embeddings=[emb],
-                       documents=[doc], metadatas=[{**meta, 'promoted_from': from_coll_name}])
-            from_col.delete(ids=[memory_id])
-            return {'status': 'ok', 'action': 'promoted', 'from': from_coll_name, 'to': to_coll}
+            
+            def try_promote(target_coll_name):
+                to_col = client.get_or_create_collection(target_coll_name)
+                to_col.add(
+                    ids=[f'promoted_{memory_id}'],
+                    embeddings=[emb],
+                    documents=[doc],
+                    metadatas=[{**meta, 'promoted_from': from_coll_name}]
+                )
+                from_col.delete(ids=[memory_id])
+                return target_coll_name
+            
+            try:
+                final_coll = try_promote(to_coll)
+            except Exception as first_err:
+                err_str = str(first_err)
+                if 'dimension' in err_str.lower():
+                    # Dimension mismatch — create versioned collection
+                    v2_coll = f'{to_coll}_v2'
+                    try:
+                        final_coll = try_promote(v2_coll)
+                    except Exception:
+                        return {'status': 'error', 'error': f'promote failed (tried v2 also): {first_err}'}
+                else:
+                    return {'status': 'error', 'error': str(first_err)}
+            
+            return {'status': 'ok', 'action': 'promoted', 'from': from_coll_name, 'to': final_coll}
+    except Exception as e:
+        return {'status': 'error', 'error': str(e)}
     except Exception as e:
         return {'status': 'error', 'error': str(e)}
 
