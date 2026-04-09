@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
 """
-mem-plus v10 — MemPalace wing/room 集成版
+mem-plus v11 — 多业务线 Domain 架构
 ===================================
-v10 新功能（来自 mempalace CLI 深度扫描）：
-  search --wing <project>: 项目级过滤召回
-  search --room <room>: 房间级过滤召回（需先指定 --wing）
-  wake-up --wing <project>: 项目级上下文唤醒
+v11 新功能（3-tier + Domain Ownership）：
+  三层记忆：Global Shared → Domain Shared → Private
+  search --domain <name>: 搜索特定业务线
+  remember --domain --agent: 写入对应域
+  promote: 晋升知识（Private → Domain → Global）
+  list-domains: 查看所有业务线
 
-v9 功能（来自 SuperMem 精华合并）：
-  exact_boost: 全词2.0 / 所有词1.5 / 部分词0.5
-  --tw --hl: 可调 temporal 参数
-  list-agents: 查看 agent 列表
-  mine+bridge: 索引后同步 SuperMem DB
-
-架构（v7实测最优）：
-  - v5 subprocess to mempalace CLI (primary)
-  - v6 direct fallback (timeout > 3s)
-  - identity_boost + keyword_boost (from v7)
-  - credential_filter (from v5)
+架构：
+  - mempalace CLI (Global Shared primary)
+  - ChromaDB (Domain/Agent private storage)
+  - identity_boost + keyword_boost + exact_boost
+  - 晋升机制：Private → Domain Shared → Global Shared
 """
 import sys
 import os
@@ -57,14 +53,98 @@ try:
 except ImportError:
     _CHROMA_AVAILABLE = False
 
-_SUPER_MEM_CHROMA = os.path.expanduser("~/.super-mem/chroma")
+_MEM_CHROMA = os.path.expanduser("~/.openclaw/memory/chroma")
+
+# ─────────────────────────────────────────────────────────────────
+# DOMAIN CONFIG — 3-tier + Domain Ownership
+# ─────────────────────────────────────────────────────────────────
+_DOMAIN_CONFIG = os.path.expanduser("~/.openclaw/workspace/skills/mem-plus/domains/domains.json")
+
+
+def _load_domains():
+    if os.path.exists(_DOMAIN_CONFIG):
+        try:
+            with open(_DOMAIN_CONFIG) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"domains": {}, "agents": {"main": {"role": "CEO", "domain": None, "level": "global"}}, "version": "1.0"}
+
+
+def _get_collection_name(domain: str = None, agent: str = None, scope: str = "shared") -> str:
+    """Get ChromaDB collection name from domain/agent/scope.
+    
+    Priority: domain (if set) > agent (if set) > global
+    - domain + agent + private → domain_{domain}_{agent}_private
+    - domain + shared → domain_{domain}_shared
+    - agent + private (no domain) → agent_{agent}_private
+    - neither → global_shared
+    """
+    import re
+    def _safe(s):
+        """Remove illegal chars for ChromaDB collection names."""
+        return re.sub(r'[^a-zA-Z0-9._-]', '_', str(s))
+    # Agent without domain → agent_{agent}_private (higher priority than domain)
+    if agent and not domain:
+        return f"agent_{_safe(agent)}_private"
+    # Domain with agent (private) → domain_{domain}_{agent}_private
+    if domain:
+        if scope == "private" and agent:
+            return f"domain_{_safe(domain)}_{_safe(agent)}_private"
+        return f"domain_{_safe(domain)}_shared"
+    # Agent with domain uses domain path above; this is fallback
+    if agent:
+        return f"agent_{_safe(agent)}_private"
+    return "global_shared"
+
+
+def _search_chroma(query_text: str, collection_name: str, limit: int = 5) -> list:
+    """Search a specific ChromaDB collection and its versioned variants.
+    
+    Searches: collection_name, collection_name_v2, collection_name_v3...
+    This handles embedding model upgrades (e.g. nomic 768-dim → bge-m3 1024-dim)
+    where old and new data live in separate collections.
+    """
+    if not _CHROMA_AVAILABLE:
+        return []
+    q_emb = ollama_embed_http([query_text])[0]
+    try:
+        client = chromadb.PersistentClient(path=_MEM_CHROMA)
+        all_items = []
+        # Search base collection + all vN variants
+        for variant in [collection_name] + [f"{collection_name}_v{n}" for n in range(2, 10)]:
+            try:
+                col = client.get_collection(variant)
+                raw = col.query(
+                    query_embeddings=[q_emb],
+                    n_results=limit * 2,
+                    include=["documents", "metadatas"]
+                )
+                docs = raw.get("documents", [[]])[0]
+                metas = raw.get("metadatas", [[]])[0]
+                if not docs:
+                    continue
+                for i, doc in enumerate(docs):
+                    meta = metas[i] if i < len(metas) else {}
+                    sf = meta.get("source_file", "")
+                    source = os.path.basename(sf) if sf else sf
+                    all_items.append({
+                        "content": doc, "source": source,
+                        "score": 1.0 - (i / max(len(docs), 1)),
+                        "meta": meta, "collection": variant
+                    })
+            except Exception:
+                break  # Collection doesn't exist, stop searching variants
+        return all_items
+    except Exception:
+        return []
 
 
 def ollama_embed_http(texts: list) -> list:
     import urllib.request
     embeddings = []
     for text in texts:
-        payload = json.dumps({"model": "nomic-embed-text", "prompt": text}).encode()
+        payload = json.dumps({"model": "bge-m3", "prompt": text}).encode()
         req = urllib.request.Request(
             "http://localhost:11434/api/embeddings",
             data=payload, headers={"Content-Type": "application/json"}, method="POST"
@@ -84,7 +164,7 @@ def v6_fallback_search(query_text: str, limit: int = 5) -> list:
         return []
     q_emb = ollama_embed_http([query_text])[0]
     try:
-        client = chromadb.PersistentClient(path=_SUPER_MEM_CHROMA)
+        client = chromadb.PersistentClient(path=_MEM_CHROMA)
         col = client.get_collection("super_mem_shared")
         raw = col.query(
             query_embeddings=[q_emb],
@@ -177,6 +257,85 @@ def identity_boost_score(source: str, content: str, query: str) -> float:
 
 def is_chinese(text: str) -> bool:
     return bool(re.search(r'[\u4e00-\u9fff]', text))
+
+
+# ─────────────────────────────────────────────────────────────────
+# 4b. CHINESE SYNONYM EXPANSION (P2 Fix: Chinese semantic search)
+# ─────────────────────────────────────────────────────────────────
+
+# 常见中文类别词 → 同类词扩展（解决 nomic-embed-text 对中文语义理解不足）
+# 当 query 包含类别词时，扩展匹配同类具体物品/概念
+_CHINESE_CATEGORY_EXPANSION = {
+    '水果': ['苹果', '香蕉', '橙子', '葡萄', '西瓜', '草莓', '桃子', '梨', '芒果', '菠萝'],
+    '水果类': ['苹果', '香蕉', '橙子', '葡萄', '西瓜', '草莓', '桃子', '梨', '芒果', '菠萝'],
+    '水果的': ['苹果', '香蕉', '橙子', '葡萄', '西瓜', '草莓', '桃子', '梨', '芒果', '菠萝'],
+    '电脑': ['笔记本', '台式机', 'PC', '计算机', 'Mac', 'Windows'],
+    '计算机': ['电脑', '笔记本', '台式机', 'PC', 'Mac'],
+    '电影': ['影片', '片子', '剧情', '导演', '演员', '豆瓣'],
+    '音乐': ['歌曲', '歌', '歌手', '专辑', '歌词', 'MP3'],
+    '书': ['书籍', '图书', '阅读', '作者', '出版社', 'Kindle'],
+    '书籍': ['书', '图书', '阅读', '作者', '出版社'],
+    '网站': ['网页', 'URL', '链接', '域名', 'Web'],
+    '应用': ['APP', '软件', '工具', '程序', 'App'],
+    '手机': ['iPhone', '安卓', 'Android', 'APP', '微信'],
+}
+
+# 双向同义词
+_CHINESE_BIDIRECTIONAL = {
+    'AI': ['人工智能', '机器学习', '深度学习'],
+    '人工智能': ['AI', '机器学习', '深度学习'],
+    '机器学习': ['ML', 'AI', '人工智能'],
+    '深度学习': ['DL', 'AI', '神经网络'],
+    'LLM': ['大模型', '语言模型', 'GPT'],
+    '大模型': ['LLM', '语言模型', 'GPT', 'ChatGPT'],
+}
+
+
+def expand_chinese_query(query: str) -> set:
+    """Expand Chinese query with category synonyms.
+    
+    When query contains a category word (e.g. '水果'),
+    expand it to include specific items in that category.
+    This compensates for nomic-embed-text's limited Chinese understanding.
+    """
+    expanded = set()
+    q_lower = query.lower()
+    
+    # Direct category expansion
+    for cat, items in _CHINESE_CATEGORY_EXPANSION.items():
+        if cat in q_lower or cat in query:
+            expanded.update(items)
+    
+    # Bidirectional synonym expansion
+    for word, synonyms in _CHINESE_BIDIRECTIONAL.items():
+        if word in q_lower or word in query:
+            expanded.update(synonyms)
+    
+    return expanded
+
+
+def chinese_concept_match_score(content: str, query: str) -> float:
+    """Check if content contains expanded query concepts.
+    
+    Returns a boost score based on how many expanded terms
+    from the query appear in the content.
+    """
+    if not is_chinese(query):
+        return 0.0
+    
+    expanded = expand_chinese_query(query)
+    if not expanded:
+        return 0.0
+    
+    content_lower = content.lower()
+    matches = sum(1 for term in expanded if term.lower() in content_lower)
+    
+    if matches == 0:
+        return 0.0
+    
+    # Score: up to +6.0 based on number of matches (1.0 per matched term)
+    # This is a strong boost to compensate for nomic-embed-text Chinese weakness
+    return min(6.0, matches * 1.0)
 
 
 def extract_chinese_tokens(text: str) -> set:
@@ -346,6 +505,11 @@ def ngram_jaccard(s1: str, s2: str, n: int = 3) -> float:
 # ─────────────────────────────────────────────────────────────────
 
 def dedup_results(results, threshold=0.85):
+    """
+    N-gram Jaccard deduplication (from SuperMem v7).
+    Injected results (_injected=True) are protected from dedup — they are
+    filesystem-precise matches (e.g. filename heading lookup) and must not be removed.
+    """
     if not results:
         return []
     # Step 1: keep highest-score per source
@@ -354,9 +518,13 @@ def dedup_results(results, threshold=0.85):
         src = r.get('source', '')
         if src not in by_source or r.get('score', 0) > by_source[src].get('score', 0):
             by_source[src] = r
-    # Step 2: n-gram Jaccard dedup
+    # Step 2: n-gram Jaccard dedup — injected results are protected
     deduped = []
     for r in by_source.values():
+        # Injected results (filesystem-precise matches) skip dedup check
+        if r.get('_injected'):
+            deduped.append(r)
+            continue
         if not any(ngram_jaccard(r['content'], e['content'], n=3) > threshold for e in deduped):
             deduped.append(r)
     return deduped
@@ -367,20 +535,13 @@ def dedup_results(results, threshold=0.85):
 # ─────────────────────────────────────────────────────────────────
 
 def mmr_rerank(results, query, lambda_param=0.7, limit=5):
+    """
+    MMR reranking using ngram Jaccard diversity (from SuperMem v7).
+    Replaces slow Levenshtein O(n*m) with fast ngram Jaccard O(n).
+    For long docs (MEMORY.md 5000+ chars), this is 10-100x faster.
+    """
     if not results or len(results) <= limit:
         return results
-    def lev_sim(s1, s2):
-        s1, s2 = s1.lower(), s2.lower()
-        if not s1 or not s2: return 0.0
-        m, n = len(s1), len(s2)
-        if m < n: s1, s2, m, n = s2, s1, n, m
-        prev = range(n + 1)
-        for i in range(m):
-            curr = [i + 1]
-            for j in range(n):
-                curr.append(min(prev[j+1]+1, curr[j]+1, prev[j]+(s1[i]!=s2[j])))
-            prev = curr
-        return 1.0 - (prev[n] / max(m, n)) if max(m, n) else 1.0
     selected, remaining = [], list(results)
     scores = [r.get('score', 0) for r in remaining]
     max_s, min_s = max(scores) if scores else 1, min(scores) if scores else 0
@@ -388,12 +549,14 @@ def mmr_rerank(results, query, lambda_param=0.7, limit=5):
     norm = lambda r: (r.get('score', 0) - min_s) / rng
     while len(selected) < limit and remaining:
         best_idx = -1
+        best_mmr = -float('inf')
         for idx, item in enumerate(remaining):
             rel = norm(item)
-            max_sim = max((lev_sim(item['content'], s['content']) for s in selected), default=0)
+            # Use ngram_jaccard instead of Levenshtein — O(n) not O(n*m)
+            max_sim = max((ngram_jaccard(item['content'], s['content'], n=3) for s in selected), default=0)
             mmr = lambda_param * rel + (1 - lambda_param) * (1 - max_sim)
-            if best_idx < 0 or mmr > (lambda_param * norm(remaining[best_idx]) +
-                    (1 - lambda_param) * (1 - max((lev_sim(remaining[best_idx]['content'], s['content']) for s in selected), default=0))):
+            if mmr > best_mmr:
+                best_mmr = mmr
                 best_idx = idx
         if best_idx < 0: break
         selected.append(remaining.pop(best_idx))
@@ -447,10 +610,12 @@ def has_plaintext_credential(content: str) -> bool:
 # 9. COMMANDS
 # ─────────────────────────────────────────────────────────────────
 
-def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True, tw=0.1, hl=30, wing=None, room=None):
+def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True, tw=0.1, hl=30, wing=None, room=None, domain=None, agent=None):
     t0 = time.time()
+    all_results = []
+    sources = []
 
-    # Primary: v5 subprocess to mempalace CLI (with optional wing/room filtering)
+    # 1. Mempalace CLI — Global Shared (always searched)
     mp_args = ['search', query, '--results', str(limit * 3)]
     if wing:
         mp_args.extend(['--wing', wing])
@@ -458,13 +623,31 @@ def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True, tw=0.1, hl
         mp_args.extend(['--room', room])
     out, err, code = call_mempalace(mp_args, timeout=_TIMEOUT)
     if code == 0:
-        results = parse_search_output(out, query)
-        source = 'mem-plus_cli(v10)'
+        mp_results = parse_search_output(out, query)
+        all_results.extend([{**r, '_source_layer': 'global'} for r in mp_results])
+        sources.append('mempalace(global)')
     else:
-        results = v6_fallback_search(query, limit=limit * 3)
-        source = 'v6_fallback'
+        sources.append('mempalace(failed)')
 
-    steps = [source]
+    # 2. Domain Shared — if domain specified
+    if domain:
+        coll = _get_collection_name(domain=domain, scope='shared')
+        domain_results = _search_chroma(query, coll, limit=limit)
+        all_results.extend([{**r, '_source_layer': f'domain:{domain}'} for r in domain_results])
+        sources.append(f'domain:{domain}_shared')
+
+    # 3. Agent Private — if agent specified
+    if agent:
+        coll = _get_collection_name(domain=domain, agent=agent, scope='private')
+        priv_results = _search_chroma(query, coll, limit=limit)
+        all_results.extend([{**r, '_source_layer': f'private:{agent}'} for r in priv_results])
+        sources.append(f'agent:{agent}_private')
+
+    if not all_results:
+        return {'status': 'ok', 'query': query, 'results': [], 'steps': sources}
+
+    results = all_results
+    steps = sources
 
     if not results:
         return {'status': 'ok', 'query': query, 'results': [], 'steps': steps}
@@ -489,13 +672,12 @@ def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True, tw=0.1, hl
     results = _filename_direct_inject(query, results)
 
     if dedup:
-        # 注意：dedup_results 对注入结果也做同源去重
-        # _filename_direct_inject 注入时已检查过同源，这里保留作为双重保障
+        # dedup_results now protects _injected results (SuperMem v7 pattern)
         results = dedup_results(results)
         steps.append(f'dedup({before_dedup}→{len(results)})')
 
     # All boosts
-    TW = tw  # temporal weight: tunable, default 10%, won't override identity boost
+    # TW=0.3 (SuperMem v7 optimum): temporal decay gets 30% weight, balanced with vector score
     for r in results:
         # 注入结果（_injected=True）已预置 filename_boost=999.0，跳过重算
         if r.get('_injected'):
@@ -503,22 +685,26 @@ def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True, tw=0.1, hl
             r['_kw_boost'] = 0.0
             r['_exact_boost'] = 2.0  # heading 精确匹配
             r['_filename_boost'] = r.get('_filename_boost', 999.0)
+            r['_chinese_concept_boost'] = 0.0
         else:
             r['_identity_boost'] = identity_boost_score(r['source'], r['content'], query)
             r['_kw_boost'] = keyword_boost_score(r['content'], query)
             r['_exact_boost'] = exact_boost_score(r['content'], query)
             r['_filename_boost'] = filename_detection(query, r['content'])
+            # P2 Fix: Chinese concept matching (category → specific items)
+            r['_chinese_concept_boost'] = chinese_concept_match_score(r['content'], query)
         mtime = get_mtime_from_meta(r.get('meta', {}))
         r['_temporal_decay'] = temporal_decay(mtime, half_life=hl)
         decay = r['_temporal_decay']
         r['final_score'] = (
-            r['score'] * (1 - TW) + r['score'] * decay * TW
+            r['score'] * (1 - tw) + r['score'] * decay * tw
             + r['_identity_boost']
             + r['_kw_boost']
             + r['_exact_boost']
             + r['_filename_boost']
+            + r['_chinese_concept_boost']
         )
-    steps.append('boosts(exact+temporal+identity+kw+filename)')
+    steps.append('boosts(exact+temporal+identity+kw+filename+cn_concept)')
 
     results = sorted(results, key=lambda x: x.get('final_score', 0), reverse=True)
 
@@ -544,7 +730,8 @@ def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True, tw=0.1, hl
                     'keyword': r.get('_kw_boost', 0),
                     'exact': r.get('_exact_boost', 0),
                     'filename': r.get('_filename_boost', 0),
-                    'temporal': round(r.get('_temporal_decay', 1), 3)
+                    'temporal': round(r.get('_temporal_decay', 1), 3),
+                    'cn_concept': round(r.get('_chinese_concept_boost', 0), 3)
                 }
             }
             for r in results[:limit]
@@ -552,7 +739,7 @@ def cmd_search(query, limit=5, use_mmr=False, dedup=True, strip=True, tw=0.1, hl
     }
 
 
-def cmd_remember(content, agent='main', room='general', source=''):
+def cmd_remember(content, agent='main', room='general', source='', domain=None):
     if has_plaintext_credential(content):
         filtered = filter_credentials(content)
         if has_plaintext_credential(filtered):
@@ -563,27 +750,58 @@ def cmd_remember(content, agent='main', room='general', source=''):
     else:
         clean_content = content
         warn = None
-    # remember: store directly in SuperMem ChromaDB via direct Python
-    import uuid
+    # remember: store in domain/agent private ChromaDB collection
+    # FIX v1: Use content hash as ID → identical content = identical ID → write-time dedup
+    # FIX v2: Handle embedding dimension mismatch (e.g. bge-m3 1024-dim vs old 768-dim)
+    import hashlib
     if _CHROMA_AVAILABLE:
         try:
-            client = chromadb.PersistentClient(path=_SUPER_MEM_CHROMA)
-            col = client.get_or_create_collection("super_mem_shared")
+            client = chromadb.PersistentClient(path=_MEM_CHROMA)
+            coll_name = _get_collection_name(domain=domain, agent=agent, scope='private')
             emb = ollama_embed_http([clean_content])[0]
-            mid = f"mem_{uuid.uuid4().hex[:12]}"
-            col.add(
-                ids=[mid],
-                embeddings=[emb],
-                documents=[clean_content],
-                metadatas=[{
-                    "source_file": source or 'cli',
-                    "room": room,
-                    "agent": agent,
-                    "stored_at": str(time.time()),
-                    "mtime": str(time.time())
-                }]
-            )
-            return {'status': 'ok', 'action': 'remember', 'id': mid, 'warning': warn}
+            new_dim = len(emb)
+            
+            # Content hash as ID: identical content → identical ID → ChromaDB upsert = dedup
+            content_hash = hashlib.sha256(clean_content.encode()).hexdigest()[:16]
+            mid = f"mem_{content_hash}"
+            
+            # Try the original collection first
+            def try_write(target_coll_name):
+                col = client.get_or_create_collection(target_coll_name)
+                # Check if identical content already exists
+                existing = col.get(ids=[mid], include=[])
+                if existing['ids']:
+                    return {'status': 'ok', 'action': 'remember', 'id': mid, 'warning': warn, 'note': 'already exists, skipped'}
+                col.add(
+                    ids=[mid],
+                    embeddings=[emb],
+                    documents=[clean_content],
+                    metadatas=[{
+                        "source_file": source or 'cli',
+                        "room": room,
+                        "agent": agent,
+                        "stored_at": str(time.time()),
+                        "mtime": str(time.time()),
+                        "embedding_dim": new_dim
+                    }]
+                )
+                return {'status': 'ok', 'action': 'remember', 'id': mid, 'warning': warn}
+            
+            try:
+                return try_write(coll_name)
+            except Exception as write_err:
+                err_str = str(write_err)
+                # ChromaDB error for dimension mismatch: "Expected 768-dim, got 1024-dim"
+                if 'dimension' in err_str.lower() or 'dimension' in err_str:
+                    # Collection has old data with different dimension → create versioned collection
+                    v2_coll_name = f"{coll_name}_v2"
+                    try:
+                        result = try_write(v2_coll_name)
+                        result['note'] = (result.get('note','') + f' | NOTE: created new v2 collection ({new_dim}-dim) due to dimension mismatch with existing data').strip()
+                        return result
+                    except Exception:
+                        pass  # Fall through to error
+                return {'status': 'error', 'error': str(write_err)}
         except Exception as e:
             return {'status': 'error', 'error': str(e)}
     return {'status': 'error', 'error': 'chromadb not available'}
@@ -611,12 +829,12 @@ def cmd_list_agents():
     if not _CHROMA_AVAILABLE:
         return {'status': 'error', 'error': 'chromadb not available'}
     try:
-        client = chromadb.PersistentClient(path=_SUPER_MEM_CHROMA)
+        client = chromadb.PersistentClient(path=_MEM_CHROMA)
         cols = client.list_collections()
         agents = sorted(
-            c.name.replace('super_mem_', '')
+            c.name.replace('agent_', '').replace('_private', '')
             for c in cols
-            if c.name.startswith('super_mem_') and c.name != 'super_mem_shared'
+            if c.name.startswith('agent_') and c.name != 'global_shared'
         )
         return {'status': 'ok', 'agents': agents, 'total': len(agents)}
     except Exception as e:
@@ -634,7 +852,7 @@ def _bridge_sync() -> dict:
         items = mp_col.get(limit=10000, include=['documents', 'metadatas'])
         if not items['ids']:
             return {'synced': 0, 'note': 'MemPalace empty'}
-        shared = chromadb.PersistentClient(path=_SUPER_MEM_CHROMA)
+        shared = chromadb.PersistentClient(path=_MEM_CHROMA)
         sc = shared.get_or_create_collection('super_mem_shared', metadata={'shared': 'true'})
         old_ids = [mid for mid in sc.get(limit=10000, include=[])['ids']
                    if mid.startswith('mp_') and not mid.startswith('mp_bridge_')]
@@ -654,6 +872,84 @@ def _bridge_sync() -> dict:
         return {'error': str(e)}
 
 
+def cmd_list_domains(verbose=False):
+    """List all domains and their collections."""
+    cfg = _load_domains()
+    if not _CHROMA_AVAILABLE:
+        return {'status': 'error', 'error': 'chromadb not available'}
+    try:
+        client = chromadb.PersistentClient(path=_MEM_CHROMA)
+        cols = {c.name: c for c in client.list_collections()}
+        domains = list(cfg.get('domains', {}).keys())
+        result = {'status': 'ok', 'domains': domains, 'collections': {}}
+        for name in cols:
+            if name.startswith('domain_') or name.startswith('agent_') or name == 'global_shared':
+                count = cols[name].count()
+                result['collections'][name] = count
+        if verbose:
+            result['config'] = cfg
+        return result
+    except Exception as e:
+        return {'status': 'error', 'error': str(e)}
+
+
+def cmd_promote(memory_id, from_domain, from_agent, to_global=False, to_domain=None):
+    """Promote a memory: Private → Domain Shared → Global Shared.
+    
+    --to-global: promote to Global Shared (mempalace)
+    --to-domain <name>: promote to Domain Shared (domain_<name>_shared)
+    
+    One of --to-global or --to-domain must be specified.
+    """
+    if not _CHROMA_AVAILABLE:
+        return {'status': 'error', 'error': 'chromadb not available'}
+    if to_global and to_domain:
+        return {'status': 'error', 'error': 'cannot use --to-global and --to-domain at the same time'}
+    if not to_global and not to_domain:
+        return {'status': 'error', 'error': 'must specify --to-global or --to-domain <name>'}
+    if to_domain == 'domain':
+        return {'status': 'error', 'error': '--to-domain <name>: <name> must be a valid domain name (e.g. strategy, product), not the literal "domain"'}
+    try:
+        client = chromadb.PersistentClient(path=_MEM_CHROMA)
+        from_coll_name = _get_collection_name(domain=from_domain, agent=from_agent, scope='private')
+        from_col = client.get_collection(from_coll_name)
+        items = from_col.get(ids=[memory_id], include=['documents', 'metadatas'])
+        if not items['ids']:
+            return {'status': 'error', 'error': 'memory not found'}
+        doc = items['documents'][0] if items['documents'] else ''
+        meta = items['metadatas'][0] if items['metadatas'] else {}
+        if to_global:
+            out, err, code = call_mempalace(['remember', doc], timeout=30)
+            if code != 0:
+                return {'status': 'error', 'error': err}
+            from_col.delete(ids=[memory_id])
+            return {'status': 'ok', 'action': 'promoted', 'from': from_coll_name, 'to': 'mempalace(global)'}
+        else:
+            to_coll = _get_collection_name(domain=to_domain, scope='shared')
+            to_col = client.get_or_create_collection(to_coll)
+            emb = ollama_embed_http([doc])[0]
+            to_col.add(ids=[f'promoted_{memory_id}'], embeddings=[emb],
+                       documents=[doc], metadatas=[{**meta, 'promoted_from': from_coll_name}])
+            from_col.delete(ids=[memory_id])
+            return {'status': 'ok', 'action': 'promoted', 'from': from_coll_name, 'to': to_coll}
+    except Exception as e:
+        return {'status': 'error', 'error': str(e)}
+
+
+def cmd_forget(memory_id, domain=None, agent=None):
+    """Delete a specific memory from domain/agent private collection."""
+    if not _CHROMA_AVAILABLE:
+        return {'status': 'error', 'error': 'chromadb not available'}
+    try:
+        client = chromadb.PersistentClient(path=_MEM_CHROMA)
+        coll_name = _get_collection_name(domain=domain, agent=agent, scope='private')
+        col = client.get_collection(coll_name)
+        col.delete(ids=[memory_id])
+        return {'status': 'ok', 'action': 'forget', 'id': memory_id, 'collection': coll_name}
+    except Exception as e:
+        return {'status': 'error', 'error': str(e)}
+
+
 def cmd_mine(path=None, do_bridge=True):
     target = path or os.path.expanduser('~/.openclaw/workspace')
     out, err, code = call_mempalace(['mine', target, '--mode', 'projects'], timeout=120)
@@ -666,23 +962,6 @@ def cmd_mine(path=None, do_bridge=True):
     return result
 
 
-def cmd_forget(memory_id):
-    if not _CHROMA_AVAILABLE:
-        return {'status': 'error', 'error': 'chromadb not available'}
-    try:
-        client = chromadb.PersistentClient(path=_SUPER_MEM_CHROMA)
-        for col in client.list_collections():
-            try:
-                collection = client.get_collection(col.name)
-                item = collection.get(ids=[memory_id])
-                if item and item['ids']:
-                    collection.delete(ids=[memory_id])
-                    return {'status': 'ok', 'action': 'forget', 'id': memory_id}
-            except Exception:
-                pass
-        return {'status': 'ok', 'action': 'forget', 'id': memory_id, 'note': 'not found'}
-    except Exception as e:
-        return {'status': 'error', 'error': str(e)}
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -708,15 +987,27 @@ if __name__ == '__main__':
     p_search.add_argument('--use-mmr', dest='use_mmr', action='store_true', default=False)
     p_search.add_argument('--no-dedup', dest='dedup', action='store_false', default=True)
     p_search.add_argument('--no-strip', dest='strip', action='store_false', default=True)
-    p_search.add_argument('--tw', type=float, default=0.1)
+    p_search.add_argument('--tw', type=float, default=0.3)  # 0.3: matches SuperMem v7 optimum
     p_search.add_argument('--hl', type=int, default=30)
     p_search.add_argument('--wing', default=None)
     p_search.add_argument('--room', default=None)
+    p_search.add_argument('--domain', '-d', default=None)
+    p_search.add_argument('--agent', '-a', default=None)
 
     subparsers.add_parser('status')
 
     p_wakeup = subparsers.add_parser('wake-up')
     p_wakeup.add_argument('--wing', default=None)
+
+    p_list = subparsers.add_parser('list-domains')
+    p_list.add_argument('--verbose', '-v', action='store_true')
+
+    p_promote = subparsers.add_parser('promote')
+    p_promote.add_argument('memory_id')
+    p_promote.add_argument('--from-domain', required=True)
+    p_promote.add_argument('--from-agent')
+    p_promote.add_argument('--to-global', dest='to_global', action='store_true', default=False)
+    p_promote.add_argument('--to-domain', dest='to_domain', default=None)
 
     subparsers.add_parser('list-agents')
 
@@ -726,19 +1017,23 @@ if __name__ == '__main__':
 
     p_forget = subparsers.add_parser('forget')
     p_forget.add_argument('memory_id')
+    p_forget.add_argument('--domain')
+    p_forget.add_argument('--agent')
 
     p_remember = subparsers.add_parser('remember')
     p_remember.add_argument('content')
     p_remember.add_argument('--agent', '-a', default='main')
     p_remember.add_argument('--room', '-r', default='general')
     p_remember.add_argument('--source', '-s', default='')
+    p_remember.add_argument('--domain', '-d', default=None)
 
     args = parser.parse_args()
 
     if args.cmd == 'search':
         result = cmd_search(args.query, args.limit, args.use_mmr, args.dedup,
                             args.strip, tw=args.tw, hl=args.hl,
-                            wing=args.wing, room=args.room)
+                            wing=args.wing, room=args.room,
+                            domain=args.domain, agent=args.agent)
     elif args.cmd == 'wake-up':
         result = cmd_wake_up(wing=args.wing)
     elif args.cmd == 'status':
@@ -747,10 +1042,15 @@ if __name__ == '__main__':
         result = cmd_mine(args.path, do_bridge=args.bridge)
     elif args.cmd == 'list-agents':
         result = cmd_list_agents()
+    elif args.cmd == 'list-domains':
+        result = cmd_list_domains(verbose=args.verbose)
+    elif args.cmd == 'promote':
+        result = cmd_promote(args.memory_id, args.from_domain, args.from_agent,
+                               to_global=args.to_global, to_domain=args.to_domain)
     elif args.cmd == 'remember':
-        result = cmd_remember(args.content, args.agent, args.room, args.source)
+        result = cmd_remember(args.content, args.agent, args.room, args.source, domain=args.domain)
     elif args.cmd == 'forget':
-        result = cmd_forget(args.memory_id)
+        result = cmd_forget(args.memory_id, domain=args.domain, agent=args.agent)
     else:
         parser.print_help()
         sys.exit(0)

@@ -1,0 +1,81 @@
+{
+  "_comment": "mem-plus 多业务线架构配置 v11.1",
+  "version": "1.1",
+  "domains": {
+    "strategy": {
+      "name": "战略与商业分析",
+      "owner": "chen",
+      "description": "商业机会、市场调研、竞品分析、战略决策",
+      "shared_collection": "domain_strategy_shared",
+      "created_at": "2026-04-09"
+    },
+    "product": {
+      "name": "产品开发",
+      "owner": "ying",
+      "description": "产品规划、技术方案、MVP开发进度",
+      "shared_collection": "domain_product_shared",
+      "created_at": "2026-04-09"
+    },
+    "marketing": {
+      "name": "营销与增长",
+      "owner": "wei",
+      "description": "内容营销、渠道推广、用户增长、转化漏斗",
+      "shared_collection": "domain_marketing_shared",
+      "created_at": "2026-04-09"
+    },
+    "team": {
+      "name": "团队共享知识库",
+      "owner": null,
+      "description": "团队协作规范、流程文档、会议纪要",
+      "shared_collection": "domain_team_shared",
+      "created_at": "2026-04-09"
+    }
+  },
+  "agents": {
+    "main": {
+      "role": "CEO",
+      "domain": null,
+      "level": "global",
+      "feishu_app_id": null,
+      "name": "CEO（我）",
+      "feishu_open_id": "ou_2f1a79d5ddd77507e4306a2dd1916870",
+      "session_key": "agent:main:feishu:direct:ou_2f1a79d5ddd77507e4306a2dd1916870"
+    },
+    "chen": {
+      "role": "Strategist",
+      "domain": "strategy",
+      "level": "domain_private",
+      "feishu_app_id": "cli_a93cf45806b8dcb0",
+      "name": "chen（商分）",
+      "responsibility": "发现机会、市场调研、趋势分析、商业模式设计",
+      "feishu_open_id": "ou_c3d77809f646b12167615e68763a0185",
+      "session_key": "agent:chen:feishu:direct:ou_c3d77809f646b12167615e68763a0185"
+    },
+    "ying": {
+      "role": "Builder",
+      "domain": "product",
+      "level": "domain_private",
+      "feishu_app_id": "cli_a93cf6312b389ccd",
+      "name": "ying（技术开发）",
+      "responsibility": "产品开发、代码实现、技术选型、MVP构建",
+      "feishu_open_id": "ou_f2d93f0428e314f489eccbddbfdd3c32",
+      "session_key": "agent:ying:feishu:direct:ou_f2d93f0428e314f489eccbddbfdd3c32"
+    },
+    "wei": {
+      "role": "Merchant",
+      "domain": "marketing",
+      "level": "domain_private",
+      "feishu_app_id": "cli_a93cf75c57b85cd3",
+      "name": "wei（营销）",
+      "responsibility": "内容营销、outreach、引流转化、客户沟通",
+      "feishu_open_id": "ou_cbc076789cb7d279ddf922fb8fe2d053",
+      "session_key": "agent:wei:feishu:direct:ou_cbc076789cb7d279ddf922fb8fe2d053"
+    }
+  },
+  "_routing_note": "团队内部通信：任何agent要找其他人 → 发消息给CEO → CEO用sessions_send立即送达",
+  "_usage_guide": {
+    "chen": "每次完成商分分析后：mem-plus_cli.py remember <结论> --agent chen --domain strategy",
+    "ying": "每次完成开发后：mem-plus_cli.py remember <技术方案/进度> --agent ying --domain product",
+    "wei": "每次完成营销动作后：mem-plus_cli.py remember <渠道/转化数据> --agent wei --domain marketing"
+  }
+}
